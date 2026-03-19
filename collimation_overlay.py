@@ -298,16 +298,28 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
     # --- Step 1: Determine peak brightness and approximate center ---
     step = CENTROID_DOWNSAMPLE
     if peak_override is not None and approx_center is not None:
-        # Fast path: tracking mode with histogram data. Skip the expensive
-        # full-frame pixel loop entirely — peak comes from native histogram,
-        # center from previous frame's detection.
+        # Fastest path: both peak and center provided (histogram + tracking).
+        # Skip the pixel scan entirely.
         peak = peak_override
         threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
         approx_cx, approx_cy = approx_center
+    elif approx_center is not None:
+        # ROI path: center known from tracking, but scan pixels for accurate
+        # peak brightness. Used with CutROI where the scan is on a small region.
+        approx_cx, approx_cy = approx_center
+        peak = 0.0
+        for y in range(0, height, step):
+            row_off = y * stride
+            for x in range(0, width, step):
+                b = _get_brightness(raw, row_off + x * bpp, bpp)
+                if b > peak:
+                    peak = b
+        if peak < 25.0:
+            return None
+        threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
     else:
         # Standard path: scan every Nth pixel for peak brightness and
         # brightness-weighted centroid. Used for initial detection.
-        step = CENTROID_DOWNSAMPLE
         sum_bx = 0.0
         sum_by = 0.0
         sum_b  = 0.0
@@ -585,16 +597,19 @@ def update_state_with_result(result):
 def _get_histogram_peak(frame):
     """Get approximate peak brightness from frame histogram (native, fast).
     Uses GetCentilePointsF(99.9) which returns a per-channel array of floats.
-    Returns the max across channels, or None if unavailable."""
+    Averages the first 3 channels (RGB) to match _get_brightness() behavior,
+    which computes (R+G+B)/3. For mono cameras (1 channel), returns that value."""
     try:
         hist = frame.CalculateHistogram()
         vals = hist.GetCentilePointsF(99.9)
         # vals is Array[Single] with one entry per channel (e.g., RGBA=4 values).
-        # Take the max across channels as the peak brightness.
-        peak = 0.0
-        for i in range(len(vals)):
-            if vals[i] > peak:
-                peak = float(vals[i])
+        # Average the first 3 (RGB), skipping channel 4 (alpha/luminance) which
+        # can be much higher and would inflate the threshold.
+        n = min(3, len(vals))
+        total = 0.0
+        for i in range(n):
+            total += float(vals[i])
+        peak = total / n
         return peak if peak > 0 else None
     except:
         return None
@@ -999,18 +1014,27 @@ def on_before_frame_display(*args):
         if _state["frame_count"] % ANALYSIS_INTERVAL == 0:
             roi_frame = None
             try:
-                # Get peak brightness from histogram (native C#, avoids pixel loop)
-                peak = _get_histogram_peak(frame)
-
                 # When tracking, use CutROI for smaller analysis region
                 approx_center = None
                 roi_ox = roi_oy = 0
+                peak = None
                 if _state["outer_cx"] is not None and _state["outer_r"] is not None:
                     roi_frame, roi_ox, roi_oy = _try_cut_roi(frame)
                     if roi_frame is not None:
+                        # CutROI active: pixel scan on small region is fast,
+                        # so let it compute the real peak (more accurate than histogram).
+                        # Only pass approx_center to skip the coarse centroid pass.
                         approx_center = (
                             _state["outer_cx"] - roi_ox,
                             _state["outer_cy"] - roi_oy,
+                        )
+                    else:
+                        # CutROI failed but tracking: use histogram peak to
+                        # skip the expensive full-frame coarse pixel scan.
+                        peak = _get_histogram_peak(frame)
+                        approx_center = (
+                            _state["outer_cx"],
+                            _state["outer_cy"],
                         )
 
                 target = roi_frame if roi_frame is not None else frame

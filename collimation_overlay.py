@@ -74,9 +74,10 @@ import System.Drawing
 
 # .NET WinForms for settings dialog
 clr.AddReference("System.Windows.Forms")
+import System.Windows.Forms
 from System.Windows.Forms import (
     Form, TabControl, TabPage, Label, NumericUpDown, TrackBar,
-    Button, Panel, ColorDialog, ToolTip, DockStyle, Padding,
+    Button, Panel, ColorDialog, CheckBox, ToolTip, DockStyle, Padding,
     FormBorderStyle, FormStartPosition, AnchorStyles,
     TickStyle, Orientation, MessageBox, MessageBoxButtons,
     MessageBoxIcon, DialogResult, AutoScaleMode as WinFormsAutoScaleMode,
@@ -92,6 +93,12 @@ from System.Windows.Forms import (
 # Default values for all configuration options.
 # Colors stored as (A, R, G, B) tuples for serialization.
 _DEFAULTS = {
+    # Overlay display toggles
+    "SHOW_CIRCLES": True,                # Inner + outer detection circles
+    "SHOW_INFO_PANEL": True,             # Detailed stats panel (top-left)
+    "SHOW_BOTTOM_BAR": True,             # X/Y offset readout bar (bottom)
+    "SHOW_CORRECTION_ARROWS": True,      # Directional correction arrows + labels
+    "SHOW_ALIGNMENT_CROSSHAIRS": False,  # Full-diameter crosshairs for visual alignment
     # Overlay colors (ARGB)
     "OUTER_CIRCLE_COLOR": (220, 255, 60, 60),      # Red - primary mirror edge
     "INNER_CIRCLE_COLOR": (220, 60, 255, 60),       # Green - secondary shadow edge
@@ -132,6 +139,9 @@ _COLOR_KEYS = frozenset(k for k in _DEFAULTS if k.endswith("_COLOR"))
 # Float keys (non-integer numeric)
 _FLOAT_KEYS = frozenset(["CIRCLE_PEN_WIDTH", "CROSSHAIR_PEN_WIDTH", "OFFSET_PEN_WIDTH",
                           "ROI_MARGIN_FACTOR", "SMOOTHING_FACTOR"])
+
+# Bool keys (on/off toggles)
+_BOOL_KEYS = frozenset(k for k in _DEFAULTS if isinstance(_DEFAULTS[k], bool))
 
 # Live config dict — read by the frame handler on every frame
 _config = {}
@@ -177,6 +187,8 @@ def save_config():
             if key in _COLOR_KEYS:
                 t = _color_to_tuple(val)
                 lines.append("%s = %d,%d,%d,%d" % (key, t[0], t[1], t[2], t[3]))
+            elif key in _BOOL_KEYS:
+                lines.append("%s = %s" % (key, "true" if val else "false"))
             elif key in _FLOAT_KEYS:
                 lines.append("%s = %.2f" % (key, val))
             else:
@@ -211,6 +223,8 @@ def load_config():
                         parts = [int(x.strip()) for x in val.split(",")]
                         if len(parts) == 4:
                             _config[key] = Color.FromArgb(parts[0], parts[1], parts[2], parts[3])
+                    elif key in _BOOL_KEYS:
+                        _config[key] = val.lower() in ("true", "1", "yes")
                     elif key in _FLOAT_KEYS:
                         _config[key] = float(val)
                     else:
@@ -282,7 +296,6 @@ _state = {
     "status": "Searching for donut...",
     "last_error": "",
     "buttons": [],          # Toolbar button names (for cleanup)
-    "display_mode": 0,      # Index into _DISPLAY_MODE_NAMES
     "ref_peak": None,       # Reference peak brightness from initial detection
     "ref_outer_r": None,    # Reference outer radius from initial detection (for ROI sizing)
     "reject_count": 0,      # Consecutive rejected detection count
@@ -291,16 +304,6 @@ _state = {
     "settings_form": None,  # Reference to open SettingsForm
 }
 
-# Display modes cycled by the toolbar button. The last mode ("Off") disables
-# the overlay entirely. Cycling past Off wraps back to the first mode.
-_DISPLAY_MODE_NAMES = [
-    "All overlays",                     # 0: info panel + bottom bar + crosshairs + arrows + circles
-    "Hide info panel",                  # 1: bottom bar + crosshairs + arrows + circles
-    "Hide info panel + bottom bar",     # 2: crosshairs + arrows + circles
-    "Circles & arrows only",            # 3: just circles + correction arrows
-    "Alignment crosshairs",             # 4: circles with full-diameter crosshairs for visual alignment
-    "Off",                              # 5: no overlay, handler returns immediately
-]
 
 
 # =============================================================================
@@ -924,13 +927,12 @@ def _try_cut_roi(frame):
 # =============================================================================
 
 def draw_overlay(gfx, width, height):
-    """Main overlay drawing function. Respects current display_mode."""
+    """Main overlay drawing function. Respects overlay toggle settings."""
     try:
         gfx.SmoothingMode = SmoothingMode.AntiAlias
     except:
         pass
 
-    mode = _state["display_mode"]
     ocx = _state["outer_cx"]
     ocy = _state["outer_cy"]
     ore = _state["outer_r"]
@@ -939,36 +941,20 @@ def draw_overlay(gfx, width, height):
     ir  = _state["inner_r"]
 
     if ocx is None or icx is None:
-        if mode < 3:
-            draw_status_text(gfx, "Searching for donut...")
+        draw_status_text(gfx, "Searching for donut...")
         return
 
-    # --- Mode 4: Alignment crosshairs ---
-    if mode == 4:
+    # --- Circles ---
+    if _config["SHOW_CIRCLES"]:
         pen = Pen(_config["OUTER_CIRCLE_COLOR"], _config["CIRCLE_PEN_WIDTH"])
         gfx.DrawEllipse(pen, float(ocx - ore), float(ocy - ore), float(ore * 2), float(ore * 2))
-        gfx.DrawLine(pen, float(ocx - ore), float(ocy), float(ocx + ore), float(ocy))
-        gfx.DrawLine(pen, float(ocx), float(ocy - ore), float(ocx), float(ocy + ore))
         pen.Dispose()
 
         pen = Pen(_config["INNER_CIRCLE_COLOR"], _config["CIRCLE_PEN_WIDTH"])
         gfx.DrawEllipse(pen, float(icx - ir), float(icy - ir), float(ir * 2), float(ir * 2))
-        gfx.DrawLine(pen, float(icx - ir), float(icy), float(icx + ir), float(icy))
-        gfx.DrawLine(pen, float(icx), float(icy - ir), float(icx), float(icy + ir))
         pen.Dispose()
-        return
 
-    # --- Circles (all modes 0-3) ---
-    pen = Pen(_config["OUTER_CIRCLE_COLOR"], _config["CIRCLE_PEN_WIDTH"])
-    gfx.DrawEllipse(pen, float(ocx - ore), float(ocy - ore), float(ore * 2), float(ore * 2))
-    pen.Dispose()
-
-    pen = Pen(_config["INNER_CIRCLE_COLOR"], _config["CIRCLE_PEN_WIDTH"])
-    gfx.DrawEllipse(pen, float(icx - ir), float(icy - ir), float(ir * 2), float(ir * 2))
-    pen.Dispose()
-
-    # --- Center crosshairs (modes 0-2) ---
-    if mode <= 2:
+        # Small center crosshairs (tied to circles)
         pen = Pen(_config["CROSSHAIR_COLOR"], _config["CROSSHAIR_PEN_WIDTH"])
         ch = float(_config["CROSSHAIR_LENGTH"])
         gfx.DrawLine(pen, float(ocx - ch), float(ocy), float(ocx + ch), float(ocy))
@@ -981,60 +967,75 @@ def draw_overlay(gfx, width, height):
         gfx.DrawLine(pen, float(icx), float(icy - ch2), float(icx), float(icy + ch2))
         pen.Dispose()
 
-    # --- Offset vector line between centers (modes 0-2) ---
-    dx = icx - ocx
-    dy = icy - ocy
-    offset_dist = math.sqrt(dx * dx + dy * dy)
-
-    if mode <= 2 and offset_dist > 0.5:
-        pen = Pen(_config["OFFSET_LINE_COLOR"], _config["OFFSET_PEN_WIDTH"])
-        try:
-            pen.DashStyle = DashStyle.Dash
-        except:
-            pass
-        gfx.DrawLine(pen, float(ocx), float(ocy), float(icx), float(icy))
-        pen.Dispose()
-
-        # Arrowhead at the inner-center end of the offset line
-        if offset_dist > 3:
-            arrow_len = min(12.0, offset_dist * 0.4)
-            angle = math.atan2(dy, dx)
-            a1 = angle + math.pi * 0.8
-            a2 = angle - math.pi * 0.8
+        # Offset vector line between centers
+        dx = icx - ocx
+        dy = icy - ocy
+        offset_dist = math.sqrt(dx * dx + dy * dy)
+        if offset_dist > 0.5:
             pen = Pen(_config["OFFSET_LINE_COLOR"], _config["OFFSET_PEN_WIDTH"])
-            gfx.DrawLine(pen,
-                float(icx), float(icy),
-                float(icx + arrow_len * math.cos(a1)), float(icy + arrow_len * math.sin(a1)))
-            gfx.DrawLine(pen,
-                float(icx), float(icy),
-                float(icx + arrow_len * math.cos(a2)), float(icy + arrow_len * math.sin(a2)))
+            try:
+                pen.DashStyle = DashStyle.Dash
+            except:
+                pass
+            gfx.DrawLine(pen, float(ocx), float(ocy), float(icx), float(icy))
             pen.Dispose()
 
-    # --- Correction arrows (all modes 0-3) ---
-    min_arrow_threshold = 1.5
-    arrow_gap = 15.0
-    arrow_shaft = 30.0
-    arrow_head = 10.0
-    arrow_pen_w = 2.5
-    corr_x = -dx
-    corr_y = -dy
+            if offset_dist > 3:
+                arrow_len = min(12.0, offset_dist * 0.4)
+                angle = math.atan2(dy, dx)
+                a1 = angle + math.pi * 0.8
+                a2 = angle - math.pi * 0.8
+                pen = Pen(_config["OFFSET_LINE_COLOR"], _config["OFFSET_PEN_WIDTH"])
+                gfx.DrawLine(pen,
+                    float(icx), float(icy),
+                    float(icx + arrow_len * math.cos(a1)), float(icy + arrow_len * math.sin(a1)))
+                gfx.DrawLine(pen,
+                    float(icx), float(icy),
+                    float(icx + arrow_len * math.cos(a2)), float(icy + arrow_len * math.sin(a2)))
+                pen.Dispose()
+    else:
+        dx = icx - ocx
+        dy = icy - ocy
+        offset_dist = math.sqrt(dx * dx + dy * dy)
 
-    # X-axis correction arrow (horizontal, above the donut)
-    if abs(corr_x) > min_arrow_threshold:
-        ax_sign = 1.0 if corr_x > 0 else -1.0
-        ax_y = float(ocy - ore - arrow_gap - 8)
-        ax_start = float(ocx)
-        ax_end = float(ocx + ax_sign * arrow_shaft)
-
-        pen = Pen(_config["OFFSET_LINE_COLOR"], arrow_pen_w)
-        gfx.DrawLine(pen, ax_start, ax_y, ax_end, ax_y)
-        gfx.DrawLine(pen, ax_end, ax_y,
-            float(ax_end - ax_sign * arrow_head * 0.7), float(ax_y - arrow_head * 0.5))
-        gfx.DrawLine(pen, ax_end, ax_y,
-            float(ax_end - ax_sign * arrow_head * 0.7), float(ax_y + arrow_head * 0.5))
+    # --- Alignment crosshairs (full-diameter, for visual overlap) ---
+    if _config["SHOW_ALIGNMENT_CROSSHAIRS"]:
+        pen = Pen(_config["OUTER_CIRCLE_COLOR"], _config["CIRCLE_PEN_WIDTH"])
+        gfx.DrawEllipse(pen, float(ocx - ore), float(ocy - ore), float(ore * 2), float(ore * 2))
+        gfx.DrawLine(pen, float(ocx - ore), float(ocy), float(ocx + ore), float(ocy))
+        gfx.DrawLine(pen, float(ocx), float(ocy - ore), float(ocx), float(ocy + ore))
         pen.Dispose()
 
-        if mode <= 2:
+        pen = Pen(_config["INNER_CIRCLE_COLOR"], _config["CIRCLE_PEN_WIDTH"])
+        gfx.DrawEllipse(pen, float(icx - ir), float(icy - ir), float(ir * 2), float(ir * 2))
+        gfx.DrawLine(pen, float(icx - ir), float(icy), float(icx + ir), float(icy))
+        gfx.DrawLine(pen, float(icx), float(icy - ir), float(icx), float(icy + ir))
+        pen.Dispose()
+
+    # --- Correction arrows ---
+    if _config["SHOW_CORRECTION_ARROWS"]:
+        min_arrow_threshold = 1.5
+        arrow_gap = 15.0
+        arrow_shaft = 30.0
+        arrow_head = 10.0
+        arrow_pen_w = 2.5
+        corr_x = -dx
+        corr_y = -dy
+
+        if abs(corr_x) > min_arrow_threshold:
+            ax_sign = 1.0 if corr_x > 0 else -1.0
+            ax_y = float(ocy - ore - arrow_gap - 8)
+            ax_start = float(ocx)
+            ax_end = float(ocx + ax_sign * arrow_shaft)
+
+            pen = Pen(_config["OFFSET_LINE_COLOR"], arrow_pen_w)
+            gfx.DrawLine(pen, ax_start, ax_y, ax_end, ax_y)
+            gfx.DrawLine(pen, ax_end, ax_y,
+                float(ax_end - ax_sign * arrow_head * 0.7), float(ax_y - arrow_head * 0.5))
+            gfx.DrawLine(pen, ax_end, ax_y,
+                float(ax_end - ax_sign * arrow_head * 0.7), float(ax_y + arrow_head * 0.5))
+            pen.Dispose()
+
             font = Font(FontFamily.GenericMonospace, _config["ARROW_LABEL_FONT_SIZE"], FontStyle.Bold)
             brush = SolidBrush(_config["OFFSET_LINE_COLOR"])
             if corr_x > 0:
@@ -1044,22 +1045,20 @@ def draw_overlay(gfx, width, height):
             font.Dispose()
             brush.Dispose()
 
-    # Y-axis correction arrow (vertical, right of the donut)
-    if abs(corr_y) > min_arrow_threshold:
-        ay_sign = 1.0 if corr_y > 0 else -1.0
-        ay_x = float(ocx + ore + arrow_gap + 8)
-        ay_start = float(ocy)
-        ay_end = float(ocy + ay_sign * arrow_shaft)
+        if abs(corr_y) > min_arrow_threshold:
+            ay_sign = 1.0 if corr_y > 0 else -1.0
+            ay_x = float(ocx + ore + arrow_gap + 8)
+            ay_start = float(ocy)
+            ay_end = float(ocy + ay_sign * arrow_shaft)
 
-        pen = Pen(_config["OFFSET_LINE_COLOR"], arrow_pen_w)
-        gfx.DrawLine(pen, ay_x, ay_start, ay_x, ay_end)
-        gfx.DrawLine(pen, ay_x, ay_end,
-            float(ay_x - arrow_head * 0.5), float(ay_end - ay_sign * arrow_head * 0.7))
-        gfx.DrawLine(pen, ay_x, ay_end,
-            float(ay_x + arrow_head * 0.5), float(ay_end - ay_sign * arrow_head * 0.7))
-        pen.Dispose()
+            pen = Pen(_config["OFFSET_LINE_COLOR"], arrow_pen_w)
+            gfx.DrawLine(pen, ay_x, ay_start, ay_x, ay_end)
+            gfx.DrawLine(pen, ay_x, ay_end,
+                float(ay_x - arrow_head * 0.5), float(ay_end - ay_sign * arrow_head * 0.7))
+            gfx.DrawLine(pen, ay_x, ay_end,
+                float(ay_x + arrow_head * 0.5), float(ay_end - ay_sign * arrow_head * 0.7))
+            pen.Dispose()
 
-        if mode <= 2:
             font = Font(FontFamily.GenericMonospace, _config["ARROW_LABEL_FONT_SIZE"], FontStyle.Bold)
             brush = SolidBrush(_config["OFFSET_LINE_COLOR"])
             if corr_y < 0:
@@ -1069,12 +1068,12 @@ def draw_overlay(gfx, width, height):
             font.Dispose()
             brush.Dispose()
 
-    # --- Info panel (mode 0 only) ---
-    if mode == 0:
+    # --- Info panel ---
+    if _config["SHOW_INFO_PANEL"]:
         draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist)
 
-    # --- Bottom bar (modes 0-1) ---
-    if mode <= 1:
+    # --- Bottom bar ---
+    if _config["SHOW_BOTTOM_BAR"]:
         draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore)
 
 
@@ -1233,7 +1232,7 @@ def draw_error_text(gfx, text):
 
 def on_before_frame_display(*args):
     """BeforeFrameDisplay event handler. Called by SharpCap on every frame."""
-    if not _state["enabled"] or _state["display_mode"] >= len(_DISPLAY_MODE_NAMES) - 1:
+    if not _state["enabled"]:
         return
 
     dbitmap = None
@@ -1374,25 +1373,6 @@ def analyze_bitmap(bmp, peak_override=None, approx_center=None):
 # =============================================================================
 # TOGGLE AND CONTROL
 # =============================================================================
-
-def cycle_display_mode():
-    """Cycle to the next display mode. Called by toolbar button or console."""
-    _state["display_mode"] = (_state["display_mode"] + 1) % len(_DISPLAY_MODE_NAMES)
-    mode = _state["display_mode"]
-    name = _DISPLAY_MODE_NAMES[mode]
-    print("[Collimation] Display: %s" % name)
-    if mode == 0:
-        _state["outer_cx"] = None
-        _state["outer_cy"] = None
-        _state["outer_r"] = None
-        _state["inner_cx"] = None
-        _state["inner_cy"] = None
-        _state["inner_r"] = None
-        _state["ref_peak"] = None
-        _state["ref_outer_r"] = None
-        _state["reject_count"] = 0
-        _state["status"] = "Searching for donut..."
-
 
 def diagnose():
     """Diagnostic tool: captures one frame and tests all pixel access methods."""
@@ -1708,7 +1688,10 @@ def show_state():
     print("[Collimation] State:")
     print("  enabled: %s" % _state["enabled"])
     print("  status: %s" % _state["status"])
-    print("  display_mode: %d (%s)" % (_state["display_mode"], _DISPLAY_MODE_NAMES[_state["display_mode"]]))
+    print("  overlays: circles=%s info=%s bar=%s arrows=%s crosshairs=%s" % (
+        _config["SHOW_CIRCLES"], _config["SHOW_INFO_PANEL"],
+        _config["SHOW_BOTTOM_BAR"], _config["SHOW_CORRECTION_ARROWS"],
+        _config["SHOW_ALIGNMENT_CROSSHAIRS"]))
     print("  frames: %d" % _state["frame_count"])
     print("  outer: cx=%.1f cy=%.1f r=%.1f" % (
         _state["outer_cx"] or 0, _state["outer_cy"] or 0, _state["outer_r"] or 0))
@@ -1839,20 +1822,26 @@ def test_image(path):
 
 # Metadata for building the settings UI: (key, label, tab, control_type, min, max, step)
 _SETTINGS_META = [
+    # --- Overlay Display tab ---
+    ("SHOW_CIRCLES",              "Detection Circles",          "Display", "bool", None, None, None),
+    ("SHOW_ALIGNMENT_CROSSHAIRS", "Centering Crosshairs",       "Display", "bool", None, None, None),
+    ("SHOW_INFO_PANEL",           "Overlay Details",            "Display", "bool", None, None, None),
+    ("SHOW_BOTTOM_BAR",           "Bottom Numerical Details",   "Display", "bool", None, None, None),
+    ("SHOW_CORRECTION_ARROWS",    "Correction Arrows",          "Display", "bool", None, None, None),
     # --- Appearance tab ---
-    ("OUTER_CIRCLE_COLOR",    "Outer Circle Color",    "Appearance", "color", None, None, None),
-    ("INNER_CIRCLE_COLOR",    "Inner Circle Color",    "Appearance", "color", None, None, None),
-    ("CROSSHAIR_COLOR",       "Crosshair Color",       "Appearance", "color", None, None, None),
-    ("OFFSET_LINE_COLOR",     "Offset/Arrow Color",    "Appearance", "color", None, None, None),
-    ("TEXT_COLOR",             "Text Color",            "Appearance", "color", None, None, None),
-    ("TEXT_BG_COLOR",          "Text Background Color", "Appearance", "color", None, None, None),
-    ("CIRCLE_PEN_WIDTH",      "Circle Line Width",     "Appearance", "float", 0.5, 10.0, 0.5),
-    ("CROSSHAIR_PEN_WIDTH",   "Crosshair Line Width",  "Appearance", "float", 0.5, 10.0, 0.5),
-    ("OFFSET_PEN_WIDTH",      "Offset Line Width",     "Appearance", "float", 0.5, 10.0, 0.5),
-    ("CROSSHAIR_LENGTH",      "Crosshair Length (px)", "Appearance", "int",   5, 100, 1),
-    ("TEXT_FONT_SIZE",         "Info Panel Font Size",  "Appearance", "int",   6, 24, 1),
-    ("BOTTOM_BAR_FONT_SIZE",  "Bottom Bar Font Size",  "Appearance", "int",   6, 24, 1),
-    ("ARROW_LABEL_FONT_SIZE", "Arrow Label Font Size", "Appearance", "int",   6, 24, 1),
+    ("OUTER_CIRCLE_COLOR",    "Outer Circle Color",    "Colors", "color", None, None, None),
+    ("INNER_CIRCLE_COLOR",    "Inner Circle Color",    "Colors", "color", None, None, None),
+    ("CROSSHAIR_COLOR",       "Crosshair Color",       "Colors", "color", None, None, None),
+    ("OFFSET_LINE_COLOR",     "Offset/Arrow Color",    "Colors", "color", None, None, None),
+    ("TEXT_COLOR",             "Text Color",            "Colors", "color", None, None, None),
+    ("TEXT_BG_COLOR",          "Text Background Color", "Colors", "color", None, None, None),
+    ("CIRCLE_PEN_WIDTH",      "Circle Line Width",     "Colors", "float", 0.5, 10.0, 0.5),
+    ("CROSSHAIR_PEN_WIDTH",   "Crosshair Line Width",  "Colors", "float", 0.5, 10.0, 0.5),
+    ("OFFSET_PEN_WIDTH",      "Offset Line Width",     "Colors", "float", 0.5, 10.0, 0.5),
+    ("CROSSHAIR_LENGTH",      "Crosshair Length (px)", "Colors", "int",   5, 100, 1),
+    ("TEXT_FONT_SIZE",         "Info Panel Font Size",  "Colors", "int",   6, 24, 1),
+    ("BOTTOM_BAR_FONT_SIZE",  "Bottom Bar Font Size",  "Colors", "int",   6, 24, 1),
+    ("ARROW_LABEL_FONT_SIZE", "Arrow Label Font Size", "Colors", "int",   6, 24, 1),
     # --- Detection tab ---
     ("NUM_RAYS",                    "Number of Rays",          "Detection", "int",   12, 360, 1),
     ("BRIGHTNESS_THRESHOLD_PERCENT","Brightness Threshold (%)", "Detection", "int",   1, 80, 1),
@@ -1872,13 +1861,14 @@ _SETTINGS_META = [
 def _build_settings_form():
     """Create and return the settings Form with all controls."""
     form = Form()
-    form.Text = "Collimation Overlay Settings"
-    form.Width = 500
-    form.Height = 560
-    form.FormBorderStyle = FormBorderStyle.FixedDialog
+    form.Text = "Live Collimation Aid"
+    form.Width = 270
+    form.Height = 400
+    form.FormBorderStyle = FormBorderStyle.FixedToolWindow
     form.MaximizeBox = False
     form.MinimizeBox = False
     form.StartPosition = FormStartPosition.CenterScreen
+    form.TopMost = True
     try:
         form.AutoScaleMode = WinFormsAutoScaleMode.Dpi
     except:
@@ -1887,37 +1877,36 @@ def _build_settings_form():
     # Tab control
     tabs = TabControl()
     tabs.Dock = DockStyle.Fill
-    tabs.Padding = Padding(6, 3, 6, 3)
+    tabs.Padding = System.Drawing.Point(3, 3)
 
     # Create tab pages
     tab_pages = {}
-    for tab_name in ["Appearance", "Detection", "Performance"]:
+    for tab_name in ["Display", "Colors", "Detection", "Performance"]:
         tp = TabPage()
         tp.Text = tab_name
         tp.AutoScroll = True
-        tp.Padding = Padding(8)
+        tp.Padding = Padding(4, 4, 4, 4)
         tab_pages[tab_name] = tp
         tabs.TabPages.Add(tp)
 
     # Bottom panel with buttons
     bottom = Panel()
-    bottom.Height = 45
+    bottom.Height = 36
     bottom.Dock = DockStyle.Bottom
-    bottom.Padding = Padding(8, 8, 8, 8)
 
     btn_reset = Button()
-    btn_reset.Text = "Reset to Defaults"
-    btn_reset.Width = 130
-    btn_reset.Height = 28
-    btn_reset.Left = 10
-    btn_reset.Top = 8
+    btn_reset.Text = "Reset"
+    btn_reset.Width = 60
+    btn_reset.Height = 24
+    btn_reset.Left = 6
+    btn_reset.Top = 5
 
     btn_save = Button()
     btn_save.Text = "Save"
-    btn_save.Width = 80
-    btn_save.Height = 28
-    btn_save.Left = form.Width - 110
-    btn_save.Top = 8
+    btn_save.Width = 60
+    btn_save.Height = 24
+    btn_save.Left = form.Width - 82
+    btn_save.Top = 5
 
     bottom.Controls.Add(btn_reset)
     bottom.Controls.Add(btn_save)
@@ -1926,66 +1915,115 @@ def _build_settings_form():
     form.Controls.Add(bottom)
 
     # Track all controls for refresh on reset
-    control_map = {}  # key -> (control, alpha_trackbar_or_None)
-
-    # Tooltip for descriptions
-    tip = ToolTip()
+    control_map = {}  # key -> (control, extra1, extra2)
 
     # Layout: stack controls vertically per tab
     tab_y = {}  # current y position per tab
+    lbl_w = 120  # label width
+    ctrl_left = 125  # control x position
+
+    # Master enable/disable checkbox at top of Display tab
+    display_controls = []  # track Display tab controls to enable/disable
+
+    cb_enable = CheckBox()
+    cb_enable.Text = "Enable Overlay"
+    cb_enable.Left = 4
+    cb_enable.Top = 4
+    cb_enable.Width = 220
+    cb_enable.Height = 22
+    cb_enable.Checked = _state["enabled"]
+    font_bold = Font(cb_enable.Font, FontStyle.Bold)
+    cb_enable.Font = font_bold
+    tab_pages["Display"].Controls.Add(cb_enable)
+    tab_y["Display"] = 32
+
+    def on_enable_change(sender, e):
+        _state["enabled"] = sender.Checked
+        for c in display_controls:
+            c.Enabled = sender.Checked
+    cb_enable.CheckedChanged += on_enable_change
 
     for key, label_text, tab_name, ctrl_type, c_min, c_max, c_step in _SETTINGS_META:
         tp = tab_pages[tab_name]
-        y = tab_y.get(tab_name, 8)
+        y = tab_y.get(tab_name, 4)
 
         lbl = Label()
         lbl.Text = label_text
-        lbl.Left = 8
+        lbl.Left = 4
         lbl.Top = y + 3
-        lbl.Width = 180
-        lbl.Height = 20
+        lbl.Width = lbl_w
+        lbl.Height = 18
         tp.Controls.Add(lbl)
 
-        if ctrl_type == "color":
-            # Color panel (click to pick) + alpha trackbar
+        if ctrl_type == "bool":
+            tp.Controls.Remove(lbl)
+
+            # Circles and crosshairs are mutually exclusive
+            if key in ("SHOW_CIRCLES", "SHOW_ALIGNMENT_CROSSHAIRS"):
+                from System.Windows.Forms import RadioButton
+                rb = RadioButton()
+                rb.Text = label_text
+                rb.Left = 4
+                rb.Top = y
+                rb.Width = 220
+                rb.Height = 22
+                rb.Checked = bool(_config[key])
+                tp.Controls.Add(rb)
+
+                def make_radio_change(k, other_k):
+                    def on_change(sender, e):
+                        if sender.Checked:
+                            _config[k] = True
+                            _config[other_k] = False
+                            # Update the other radio button's control
+                            other_entry = control_map.get(other_k)
+                            if other_entry and other_entry[0] is not None:
+                                other_entry[0].Checked = False
+                    return on_change
+
+                other_key = "SHOW_ALIGNMENT_CROSSHAIRS" if key == "SHOW_CIRCLES" else "SHOW_CIRCLES"
+                rb.CheckedChanged += make_radio_change(key, other_key)
+
+                control_map[key] = (rb, None, None)
+                if tab_name == "Display":
+                    rb.Enabled = _state["enabled"]
+                    display_controls.append(rb)
+                tab_y[tab_name] = y + 24
+            else:
+                cb = CheckBox()
+                cb.Text = label_text
+                cb.Left = 4
+                cb.Top = y
+                cb.Width = 220
+                cb.Height = 22
+                cb.Checked = bool(_config[key])
+                tp.Controls.Add(cb)
+
+                def make_bool_change(k):
+                    def on_change(sender, e):
+                        _config[k] = sender.Checked
+                    return on_change
+                cb.CheckedChanged += make_bool_change(key)
+
+                control_map[key] = (cb, None, None)
+                if tab_name == "Display":
+                    cb.Enabled = _state["enabled"]
+                    display_controls.append(cb)
+                tab_y[tab_name] = y + 24
+
+        elif ctrl_type == "color":
             color_val = _config[key]
 
             pnl = Panel()
-            pnl.Left = 195
+            pnl.Left = ctrl_left
             pnl.Top = y
-            pnl.Width = 50
-            pnl.Height = 24
+            pnl.Width = 90
+            pnl.Height = 20
             pnl.BackColor = Color.FromArgb(255, color_val.R, color_val.G, color_val.B)
-            pnl.BorderStyle = 1  # FixedSingle
+            pnl.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle
             tp.Controls.Add(pnl)
 
-            alpha_lbl = Label()
-            alpha_lbl.Text = "A: %d" % color_val.A
-            alpha_lbl.Left = 250
-            alpha_lbl.Top = y + 3
-            alpha_lbl.Width = 45
-            alpha_lbl.Height = 20
-            tp.Controls.Add(alpha_lbl)
-
-            alpha_tb = TrackBar()
-            alpha_tb.Left = 295
-            alpha_tb.Top = y - 2
-            alpha_tb.Width = 150
-            alpha_tb.Height = 30
-            alpha_tb.Minimum = 0
-            alpha_tb.Maximum = 255
-            alpha_tb.Value = color_val.A
-            alpha_tb.TickFrequency = 32
-            alpha_tb.TickStyle = TickStyle.None
-            tp.Controls.Add(alpha_tb)
-
-            # Wire up color panel click
-            _key = key  # capture for closure
-            _pnl = pnl
-            _alpha_tb = alpha_tb
-            _alpha_lbl = alpha_lbl
-
-            def make_color_click(k, p, atb, albl):
+            def make_color_click(k, p):
                 def on_click(sender, e):
                     dlg = ColorDialog()
                     cur = _config[k]
@@ -1993,30 +2031,20 @@ def _build_settings_form():
                     dlg.FullOpen = True
                     if dlg.ShowDialog() == DialogResult.OK:
                         c = dlg.Color
-                        alpha = atb.Value
-                        _config[k] = Color.FromArgb(alpha, c.R, c.G, c.B)
+                        _config[k] = Color.FromArgb(cur.A, c.R, c.G, c.B)
                         p.BackColor = Color.FromArgb(255, c.R, c.G, c.B)
                 return on_click
-            pnl.Click += make_color_click(_key, _pnl, _alpha_tb, _alpha_lbl)
+            pnl.Click += make_color_click(key, pnl)
 
-            def make_alpha_change(k, p, albl):
-                def on_change(sender, e):
-                    alpha = sender.Value
-                    cur = _config[k]
-                    _config[k] = Color.FromArgb(alpha, cur.R, cur.G, cur.B)
-                    albl.Text = "A: %d" % alpha
-                return on_change
-            alpha_tb.ValueChanged += make_alpha_change(_key, _pnl, _alpha_lbl)
-
-            control_map[key] = (pnl, alpha_tb, alpha_lbl)
-            tab_y[tab_name] = y + 30
+            control_map[key] = (pnl, None, None)
+            tab_y[tab_name] = y + 24
 
         elif ctrl_type == "float":
             nud = NumericUpDown()
-            nud.Left = 195
+            nud.Left = ctrl_left
             nud.Top = y
-            nud.Width = 80
-            nud.Height = 24
+            nud.Width = 65
+            nud.Height = 22
             nud.DecimalPlaces = 2
             nud.Minimum = System.Decimal(c_min)
             nud.Maximum = System.Decimal(c_max)
@@ -2031,14 +2059,14 @@ def _build_settings_form():
             nud.ValueChanged += make_float_change(key)
 
             control_map[key] = (nud, None, None)
-            tab_y[tab_name] = y + 30
+            tab_y[tab_name] = y + 26
 
         elif ctrl_type == "int":
             nud = NumericUpDown()
-            nud.Left = 195
+            nud.Left = ctrl_left
             nud.Top = y
-            nud.Width = 80
-            nud.Height = 24
+            nud.Width = 65
+            nud.Height = 22
             nud.DecimalPlaces = 0
             nud.Minimum = System.Decimal(c_min)
             nud.Maximum = System.Decimal(c_max)
@@ -2053,7 +2081,7 @@ def _build_settings_form():
             nud.ValueChanged += make_int_change(key)
 
             control_map[key] = (nud, None, None)
-            tab_y[tab_name] = y + 30
+            tab_y[tab_name] = y + 26
 
     # --- Button handlers ---
     def on_reset(sender, e):
@@ -2064,13 +2092,11 @@ def _build_settings_form():
             if entry is None:
                 continue
             ctrl, extra1, extra2 = entry
-            if ctrl_type == "color":
+            if ctrl_type == "bool":
+                ctrl.Checked = bool(_config[key])
+            elif ctrl_type == "color":
                 color_val = _config[key]
                 ctrl.BackColor = Color.FromArgb(255, color_val.R, color_val.G, color_val.B)
-                if extra1 is not None:
-                    extra1.Value = color_val.A
-                if extra2 is not None:
-                    extra2.Text = "A: %d" % color_val.A
             elif ctrl_type == "float":
                 ctrl.Value = System.Decimal(float(_config[key]))
             elif ctrl_type == "int":
@@ -2246,16 +2272,6 @@ def setup():
 
     buttons = []
 
-    # Overlay toggle button
-    btn_name = "Coll Overlay"
-    icon = _make_icon("toggle")
-    if _add_toolbar_button(btn_name, icon, "Cycle collimation overlay mode", cycle_display_mode):
-        buttons.append(btn_name)
-        print("[OK] Toolbar button: '%s'" % btn_name)
-    else:
-        print("[WARN] Could not add overlay button")
-        print("  Use cycle_display_mode() in console")
-
     # Settings button
     btn_settings = "Coll Settings"
     icon_settings = _make_icon("settings")
@@ -2271,19 +2287,12 @@ def setup():
     attach_handler()
 
     print("")
-    print("'%s' button cycles:" % btn_name)
-    for i, name in enumerate(_DISPLAY_MODE_NAMES):
-        marker = ">>>" if i == 0 else "   "
-        print("  %s %d. %s" % (marker, i + 1, name))
-    print("")
     print("Console commands:")
-    print("  cycle_display_mode()   - same as overlay button")
     print("  settings()             - open settings dialog")
     print("  reset_tracking()       - re-detect donut")
     print("  show_state()           - debug info")
     print("  debug_on() / debug_off() - per-frame logging")
-    print("  probe_apis()           - test new SharpCap APIs")
-    print("  stop()                 - fully stop + remove buttons")
+    print("  stop()                 - fully stop + remove button")
     print("=" * 50)
 
 

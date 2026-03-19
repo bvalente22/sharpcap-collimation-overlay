@@ -1,23 +1,51 @@
 # =============================================================================
 # SharpCap Collimation Overlay Script
 # =============================================================================
-# Draws concentric circle overlays on a defocused star (donut) to aid
-# collimation of reflector telescopes. Detects the inner (secondary shadow)
-# and outer (primary mirror edge) circles and displays their offset.
 #
-# Usage:
-#   1. Open SharpCap and connect your camera
-#   2. Start live preview with a bright, defocused star visible
-#   3. Run this script from SharpCap's scripting console (Tools > Scripting Console)
-#   4. Use the "Collimation" toolbar button to toggle on/off
+# PURPOSE:
+#   Draws concentric circle overlays on a defocused star (donut) to aid
+#   collimation of reflector telescopes. A defocused star in a reflector
+#   appears as a donut: a bright ring (primary mirror) with a dark center
+#   (secondary mirror shadow). Perfect collimation = concentric circles.
+#   This script auto-detects both circles, measures their offset, and
+#   shows correction guidance in real time on SharpCap's live preview.
 #
-# Requires: SharpCap Pro 4.1+ with scripting enabled
+# ARCHITECTURE:
+#   The script registers an event handler on SharpCap's BeforeFrameDisplay
+#   event. This handler fires on every displayed frame, allowing us to:
+#     1. Read pixel data via frame.GetFrameBitmap() + LockBits
+#     2. Analyze the image for a donut pattern (radial ray casting)
+#     3. Fit circles to detected edges (Kasa least-squares method)
+#     4. Draw overlays via frame.GetDrawableBitmap().GetGraphics()
+#
+#   The script itself runs once to set up the handler and toolbar button,
+#   then exits. The handler remains attached and runs per-frame until
+#   stop() is called or SharpCap closes.
+#
+# SHARPCAP API NOTES (4.1):
+#   - GetDrawableBitmap().GetGraphics() returns WinformGraphicsImpl, a
+#     wrapper around System.Drawing.Graphics. Most GDI+ methods work but:
+#       * FillRectangle requires (brush, RectangleF) not (brush, x, y, w, h)
+#       * SmoothingMode/DashStyle may not be supported (wrapped in try/except)
+#   - GetDrawableBitmap().GetBitmap() returns the OVERLAY layer (blank),
+#     NOT the camera frame. Use frame.GetFrameBitmap() for actual pixels.
+#   - AddCustomButton takes 4 args but the arg order varies by version.
+#     We try 3 orderings and use whichever works.
+#
+# USAGE:
+#   1. Open SharpCap, connect camera, start live preview
+#   2. Defocus a bright star until you see a donut shape
+#   3. Tools > Scripting Console > File > Run Script > select this file
+#   4. Click "Coll Overlay" toolbar button to cycle display modes
+#
+# Requires: SharpCap Pro 4.1+ (scripting is a Pro feature)
 # =============================================================================
 
 import clr
 import math
 import time
 
+# .NET assemblies for drawing and pixel access
 clr.AddReference("System.Drawing")
 from System.Drawing import (
     Color, Pen, SolidBrush, Font, FontFamily, FontStyle,
@@ -32,46 +60,56 @@ import System.Drawing
 # =============================================================================
 # USER CONFIGURATION
 # =============================================================================
+# Edit these values to customize the overlay appearance and behavior.
+# All colors use ARGB format: Color.FromArgb(alpha, red, green, blue)
 
-# Circle colors (R, G, B, Alpha 0-255)
-OUTER_CIRCLE_COLOR = Color.FromArgb(220, 255, 60, 60)     # Red
-INNER_CIRCLE_COLOR = Color.FromArgb(220, 60, 255, 60)     # Green
-CROSSHAIR_COLOR    = Color.FromArgb(180, 255, 255, 0)     # Yellow
-OFFSET_LINE_COLOR  = Color.FromArgb(220, 0, 220, 255)     # Cyan
-TEXT_COLOR          = Color.FromArgb(240, 255, 255, 255)   # White
-TEXT_BG_COLOR       = Color.FromArgb(160, 0, 0, 0)         # Semi-transparent black
+# Overlay colors
+OUTER_CIRCLE_COLOR = Color.FromArgb(220, 255, 60, 60)     # Red - primary mirror edge
+INNER_CIRCLE_COLOR = Color.FromArgb(220, 60, 255, 60)     # Green - secondary shadow edge
+CROSSHAIR_COLOR    = Color.FromArgb(180, 255, 255, 0)     # Yellow - outer center marker
+OFFSET_LINE_COLOR  = Color.FromArgb(220, 0, 220, 255)     # Cyan - offset vector & arrows
+TEXT_COLOR          = Color.FromArgb(240, 255, 255, 255)   # White - info panel text
+TEXT_BG_COLOR       = Color.FromArgb(160, 0, 0, 0)         # Semi-transparent black background
 
-# Line widths
+# Line widths (in pixels)
 CIRCLE_PEN_WIDTH    = 2.0
 CROSSHAIR_PEN_WIDTH = 1.0
 OFFSET_PEN_WIDTH    = 2.0
 
-# Crosshair size (pixels extending from center)
+# Crosshair size (pixels extending from center, used in modes 0-2)
 CROSSHAIR_LENGTH = 20
 
-# Text sizes
+# Text sizes (in points)
 TEXT_FONT_SIZE = 9              # Info panel and status text
-BOTTOM_BAR_FONT_SIZE = 10      # Bottom bar large text
-ARROW_LABEL_FONT_SIZE = 8      # Correction arrow labels
+BOTTOM_BAR_FONT_SIZE = 10      # Bottom bar offset readout
+ARROW_LABEL_FONT_SIZE = 8      # Correction arrow labels (MOVE X/Y)
 
-# Analysis parameters
-NUM_RAYS = 90                       # Radial rays for edge detection (more = accurate, slower)
-BRIGHTNESS_THRESHOLD_PERCENT = 30   # % of peak brightness to define edges
-CENTROID_DOWNSAMPLE = 4             # Sample every Nth pixel for centroid (speed)
-MIN_DONUT_RADIUS = 15               # Minimum expected donut radius in pixels
-RAY_STEP = 1                        # Pixel step along each ray
+# Detection parameters
+NUM_RAYS = 90                       # Radial rays for edge detection. More = accurate, slower.
+BRIGHTNESS_THRESHOLD_PERCENT = 30   # % of peak brightness that defines the donut edge.
+                                    # Lower = more sensitive (picks up faint edges).
+                                    # Higher = stricter (only bright edges).
+CENTROID_DOWNSAMPLE = 4             # Sample every Nth pixel when computing centroid.
+                                    # Higher = faster but less precise initial center.
+MIN_DONUT_RADIUS = 15               # Ignore detected circles smaller than this (pixels).
+RAY_STEP = 1                        # Pixel step along each ray. 1 = every pixel.
 
-# Smoothing (0.0 = no smoothing, higher = more smoothing, max ~0.9)
+# Smoothing: exponential moving average applied to circle positions/radii.
+# 0.0 = no smoothing (instant response, may jitter)
+# 0.9 = heavy smoothing (very stable, slow to respond to changes)
 SMOOTHING_FACTOR = 0.6
 
-# How often to run full analysis (1 = every frame, 3 = every 3rd frame, etc.)
+# Analyze every Nth frame. Higher = less CPU but slower response.
+# 1 = every frame, 2 = every other frame, etc.
 ANALYSIS_INTERVAL = 2
 
 # =============================================================================
 # INTERNAL STATE
 # =============================================================================
 
-# Check if we're re-running - clean up previous instance
+# If the script is re-run, clean up the previous instance's event handler
+# and toolbar buttons to prevent duplicates. This works because IronPython
+# keeps global variables alive across script runs in the same console session.
 try:
     _prev_state = _state
     if _prev_state.get("handler_attached"):
@@ -81,7 +119,6 @@ try:
                 cam.BeforeFrameDisplay -= on_before_frame_display
         except:
             pass
-    # Remove old buttons
     for btn_name in _prev_state.get("buttons", []):
         try:
             SharpCap.RemoveCustomButton(btn_name)
@@ -89,44 +126,55 @@ try:
             pass
     print("[Collimation] Cleaned up previous instance")
 except NameError:
-    pass  # First run, no previous state
+    pass  # First run, no previous _state exists
 
+# Global state dictionary. Using a dict (mutable) so closures/handlers can
+# modify values without needing the 'global' keyword (IronPython quirk).
 _state = {
     "enabled": True,
-    "outer_cx": None, "outer_cy": None, "outer_r": None,
-    "inner_cx": None, "inner_cy": None, "inner_r": None,
+    "outer_cx": None, "outer_cy": None, "outer_r": None,   # Smoothed outer circle
+    "inner_cx": None, "inner_cy": None, "inner_r": None,   # Smoothed inner circle
     "frame_count": 0,
     "handler_attached": False,
     "status": "Searching for donut...",
     "last_error": "",
-    "buttons": [],  # track button names for cleanup
-    "display_mode": 0,  # 0=all, 1=no panel, 2=no panel+bar, 3=circles+arrows, 4=alignment crosshairs, 5=off
+    "buttons": [],          # Toolbar button names (for cleanup)
+    "display_mode": 0,      # Index into _DISPLAY_MODE_NAMES
 }
 
-# Display mode names for user feedback
+# Display modes cycled by the toolbar button. The last mode ("Off") disables
+# the overlay entirely. Cycling past Off wraps back to the first mode.
 _DISPLAY_MODE_NAMES = [
-    "All overlays",
-    "Hide info panel",
-    "Hide info panel + bottom bar",
-    "Circles & arrows only",
-    "Alignment crosshairs",
-    "Off",
+    "All overlays",                     # 0: info panel + bottom bar + crosshairs + arrows + circles
+    "Hide info panel",                  # 1: bottom bar + crosshairs + arrows + circles
+    "Hide info panel + bottom bar",     # 2: crosshairs + arrows + circles
+    "Circles & arrows only",            # 3: just circles + correction arrows
+    "Alignment crosshairs",             # 4: circles with full-diameter crosshairs for visual alignment
+    "Off",                              # 5: no overlay, handler returns immediately
 ]
 
 
 # =============================================================================
 # CIRCLE FITTING - Kasa algebraic method (least squares)
 # =============================================================================
+# Given a set of (x, y) edge points, fits the best circle (cx, cy, r).
+# This is a non-iterative algebraic method that solves a linear system.
+# Reference: I. Kasa, "A curve fitting procedure and its error analysis",
+# IEEE Trans. Inst. Meas., 1976.
 
 def fit_circle(points):
     """
     Fit a circle to a list of (x, y) points using the Kasa algebraic method.
     Returns (center_x, center_y, radius) or None if fitting fails.
+
+    Requires at least 5 points. Returns None if the system is degenerate
+    (collinear points) or the fitted radius is too small.
     """
     n = len(points)
     if n < 5:
         return None
 
+    # Accumulate sums for the normal equations
     sx = sy = sx2 = sy2 = sxy = sx3 = sy3 = sx2y = sxy2 = 0.0
     for px, py in points:
         x2 = px * px
@@ -141,6 +189,7 @@ def fit_circle(points):
         sx2y += x2 * py
         sxy2 += px * y2
 
+    # Build and solve the 2x2 linear system for circle center (cx, cy)
     a11 = n * sx2 - sx * sx
     a12 = n * sxy - sx * sy
     a22 = n * sy2 - sy * sy
@@ -149,11 +198,12 @@ def fit_circle(points):
 
     det = a11 * a22 - a12 * a12
     if abs(det) < 1e-10:
-        return None
+        return None  # Degenerate (collinear points)
 
     cx = (b1 * a22 - a12 * b2) / det
     cy = (a11 * b2 - b1 * a12) / det
 
+    # Radius = RMS distance from center to all points
     sum_r2 = 0.0
     for px, py in points:
         dx = px - cx
@@ -168,10 +218,15 @@ def fit_circle(points):
 
 
 def reject_outliers_and_refit(points, cx, cy, radius):
-    """Remove outlier edge points and refit for higher accuracy."""
+    """
+    Remove edge points that are far from the initial circle fit, then refit.
+    This improves accuracy when some rays hit noise or diffraction rings.
+    Tolerance is proportional to radius (larger circles allow more slack).
+    """
     if len(points) < 10:
         return cx, cy, radius
 
+    # Tolerance: points within 2 * (15% of radius + 3px) of the fitted circle
     filtered = []
     tol = radius * 0.15 + 3
     for px, py in points:
@@ -180,7 +235,7 @@ def reject_outliers_and_refit(points, cx, cy, radius):
             filtered.append((px, py))
 
     if len(filtered) < 8:
-        return cx, cy, radius
+        return cx, cy, radius  # Too many rejected, keep original
 
     result = fit_circle(filtered)
     if result is None:
@@ -191,9 +246,19 @@ def reject_outliers_and_refit(points, cx, cy, radius):
 # =============================================================================
 # IMAGE ANALYSIS
 # =============================================================================
+# The donut detection algorithm:
+#   1. Find the approximate center using brightness-weighted centroid
+#   2. Refine the center using only bright pixels near the initial centroid
+#   3. Cast NUM_RAYS radial rays outward from center. Along each ray, detect:
+#      - Inner edge: first dark-to-bright transition (secondary shadow boundary)
+#      - Outer edge: first bright-to-dark transition after that (primary mirror boundary)
+#   4. Fit circles to the inner and outer edge point sets
+#   5. Reject outliers and refit for higher accuracy
+#   6. Validate: inner radius < outer radius, centers not too far apart, etc.
 
 def _get_brightness(pixels, offset, bpp):
-    """Get brightness from raw byte array at given offset."""
+    """Extract grayscale brightness from raw byte array at given byte offset.
+    For RGB (bpp>=3), averages the three channels. For mono, returns the byte value."""
     if bpp >= 3:
         return (pixels[offset] + pixels[offset + 1] + pixels[offset + 2]) / 3.0
     else:
@@ -202,14 +267,22 @@ def _get_brightness(pixels, offset, bpp):
 
 def analyze_donut_raw(raw, stride, bpp, width, height):
     """
-    Analyze raw byte pixel data for a donut pattern.
-    raw: .NET byte array from LockBits
-    stride: row stride in bytes
-    bpp: bytes per pixel
+    Analyze raw byte pixel data (from LockBits) for a donut pattern.
+
+    Args:
+        raw: .NET byte array containing pixel data
+        stride: row stride in bytes (may differ from width*bpp due to padding)
+        bpp: bytes per pixel (1 for mono, 3 for RGB, 4 for ARGB)
+        width, height: image dimensions in pixels
+
+    Returns:
+        Dict with inner/outer circle parameters, or None if no donut found.
     """
     step = CENTROID_DOWNSAMPLE
 
-    # --- Step 1: Find peak brightness and centroid ---
+    # --- Step 1: Coarse pass to find peak brightness and approximate center ---
+    # We compute a brightness-weighted centroid over the whole image, sampling
+    # every `step` pixels for speed. This gives us a rough center of the donut.
     sum_bx = 0.0
     sum_by = 0.0
     sum_b  = 0.0
@@ -221,25 +294,27 @@ def analyze_donut_raw(raw, stride, bpp, width, height):
             b = _get_brightness(raw, row_off + x * bpp, bpp)
             if b > peak:
                 peak = b
-            if b > 15.0:
+            if b > 15.0:  # Ignore pixels below noise floor
                 sum_bx += x * b
                 sum_by += y * b
                 sum_b  += b
 
     if sum_b < 1.0 or peak < 25.0:
-        return None
+        return None  # No bright object found
 
     approx_cx = sum_bx / sum_b
     approx_cy = sum_by / sum_b
     threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
 
-    # --- Step 2: Refine center using bright pixels near centroid ---
+    # --- Step 2: Refine center using only bright pixels near the centroid ---
+    # The coarse centroid can be pulled off by background gradients. Here we
+    # restrict to a region around the initial estimate and only use bright pixels.
     search_r = int(min(width, height) * 0.3)
     x_min = max(0, int(approx_cx) - search_r)
     x_max = min(width, int(approx_cx) + search_r)
     y_min = max(0, int(approx_cy) - search_r)
     y_max = min(height, int(approx_cy) + search_r)
-    step2 = max(1, step // 2)
+    step2 = max(1, step // 2)  # Finer sampling for refinement
 
     sum_bx2 = 0.0
     sum_by2 = 0.0
@@ -258,7 +333,11 @@ def analyze_donut_raw(raw, stride, bpp, width, height):
         approx_cx = sum_bx2 / sum_b2
         approx_cy = sum_by2 / sum_b2
 
-    # --- Step 3: Cast rays to find inner/outer edges ---
+    # --- Step 3: Cast rays outward from center to find inner/outer edges ---
+    # Each ray walks pixel-by-pixel from the center outward, looking for
+    # brightness transitions. The first dark->bright transition is the inner
+    # edge (boundary of the secondary shadow). The next bright->dark transition
+    # is the outer edge (boundary of the primary mirror light cone).
     inner_points = []
     outer_points = []
     max_ray_len = int(min(width, height) * 0.45)
@@ -282,37 +361,42 @@ def analyze_donut_raw(raw, stride, bpp, width, height):
             is_bright = b > threshold
 
             if not in_bright and is_bright:
+                # Transition: dark -> bright = inner edge of the donut ring
                 if not found_inner:
                     inner_points.append((px, py))
                     found_inner = True
                 in_bright = True
             elif in_bright and not is_bright:
+                # Transition: bright -> dark = outer edge of the donut ring
                 outer_points.append((px, py))
                 break
 
+    # Need enough edge points from enough rays for a reliable circle fit
     if len(inner_points) < 12 or len(outer_points) < 12:
         return None
 
-    # --- Step 4: Fit circles ---
+    # --- Step 4: Fit circles to the inner and outer edge point sets ---
     inner_fit = fit_circle(inner_points)
     outer_fit = fit_circle(outer_points)
 
     if inner_fit is None or outer_fit is None:
         return None
 
+    # Refine by removing outliers (e.g., rays that hit diffraction rings)
     inner_fit = reject_outliers_and_refit(inner_points, inner_fit[0], inner_fit[1], inner_fit[2])
     outer_fit = reject_outliers_and_refit(outer_points, outer_fit[0], outer_fit[1], outer_fit[2])
 
     icx, icy, ir = inner_fit
     ocx, ocy, ore = outer_fit
 
+    # --- Sanity checks ---
     if ir >= ore:
-        return None
+        return None  # Inner can't be larger than outer
     if ir < MIN_DONUT_RADIUS * 0.3:
-        return None
+        return None  # Inner circle too small to be real
     center_dist = math.sqrt((icx - ocx) ** 2 + (icy - ocy) ** 2)
     if center_dist > ore * 0.5:
-        return None
+        return None  # Centers too far apart — probably a bad detection
 
     return {
         "inner_cx": icx, "inner_cy": icy, "inner_r": ir,
@@ -322,12 +406,12 @@ def analyze_donut_raw(raw, stride, bpp, width, height):
 
 def analyze_donut_floats(pixels, width, height):
     """
-    Analyze a float array (one value per pixel) to detect a donut-shaped
-    defocused star. Returns dict with inner/outer circle params, or None.
+    Same algorithm as analyze_donut_raw but for a flat float array
+    (one float per pixel). Used by test_synthetic() which generates
+    float data. Not used in live mode (live uses raw bytes from LockBits).
 
-    pixels: .NET float array from frame.ToFloats(0), length = width * height
+    pixels: Python list or .NET float array, length = width * height
     """
-
     # --- Step 1: Find peak brightness and brightness-weighted centroid ---
     sum_bx = 0.0
     sum_by = 0.0
@@ -422,14 +506,12 @@ def analyze_donut_floats(pixels, width, height):
     if inner_fit is None or outer_fit is None:
         return None
 
-    # Refine with outlier rejection
     inner_fit = reject_outliers_and_refit(inner_points, inner_fit[0], inner_fit[1], inner_fit[2])
     outer_fit = reject_outliers_and_refit(outer_points, outer_fit[0], outer_fit[1], outer_fit[2])
 
     icx, icy, ir = inner_fit
     ocx, ocy, ore = outer_fit
 
-    # Sanity checks
     if ir >= ore:
         return None
     if ir < MIN_DONUT_RADIUS * 0.3:
@@ -447,14 +529,18 @@ def analyze_donut_floats(pixels, width, height):
 # =============================================================================
 # SMOOTHING
 # =============================================================================
+# Exponential moving average to stabilize circle positions across frames.
+# Without smoothing, the overlay can jitter due to noise in edge detection.
 
 def smooth_val(old, new, factor):
+    """Apply exponential smoothing: result = old*factor + new*(1-factor)."""
     if old is None:
         return new
     return old * factor + new * (1.0 - factor)
 
 
 def update_state_with_result(result):
+    """Apply smoothing to new analysis results and store in global state."""
     f = SMOOTHING_FACTOR
     _state["outer_cx"] = smooth_val(_state["outer_cx"], result["outer_cx"], f)
     _state["outer_cy"] = smooth_val(_state["outer_cy"], result["outer_cy"], f)
@@ -468,12 +554,15 @@ def update_state_with_result(result):
 # =============================================================================
 # OVERLAY DRAWING
 # =============================================================================
-# Note: gfx is a WinformGraphicsImpl wrapper, not raw System.Drawing.Graphics.
-# It supports DrawEllipse, DrawLine, DrawString, FillRectangle with Pen/Brush args.
+# All drawing uses SharpCap's WinformGraphicsImpl wrapper, obtained via
+# frame.GetDrawableBitmap().GetGraphics(). This wrapper supports standard
+# GDI+ drawing methods (DrawEllipse, DrawLine, DrawString, FillRectangle)
+# but FillRectangle requires a RectangleF object instead of separate x/y/w/h.
+# SmoothingMode and DashStyle are wrapped in try/except as they may not be
+# supported on all wrapper versions.
 
 def draw_overlay(gfx, width, height):
-    """Draw the collimation overlay using current state values."""
-    # Try to enable anti-aliasing (may not be supported on wrapper)
+    """Main overlay drawing function. Respects current display_mode."""
     try:
         gfx.SmoothingMode = SmoothingMode.AntiAlias
     except:
@@ -492,34 +581,38 @@ def draw_overlay(gfx, width, height):
             draw_status_text(gfx, "Searching for donut...")
         return
 
-    # --- Mode 4: Alignment crosshairs (circles + full-diameter crosshairs) ---
+    # --- Mode 4: Alignment crosshairs ---
+    # Draws both circles with full-diameter crosshairs in their respective
+    # colors. When collimation is perfect, the red and green crosshairs
+    # overlap exactly. This is a minimal mode for precise visual alignment.
     if mode == 4:
-        # Outer circle + diameter crosshair in red
+        # Outer circle + full-diameter crosshair in red
         pen = Pen(OUTER_CIRCLE_COLOR, CIRCLE_PEN_WIDTH)
         gfx.DrawEllipse(pen, float(ocx - ore), float(ocy - ore), float(ore * 2), float(ore * 2))
         gfx.DrawLine(pen, float(ocx - ore), float(ocy), float(ocx + ore), float(ocy))
         gfx.DrawLine(pen, float(ocx), float(ocy - ore), float(ocx), float(ocy + ore))
         pen.Dispose()
 
-        # Inner circle + diameter crosshair in green
+        # Inner circle + full-diameter crosshair in green
         pen = Pen(INNER_CIRCLE_COLOR, CIRCLE_PEN_WIDTH)
         gfx.DrawEllipse(pen, float(icx - ir), float(icy - ir), float(ir * 2), float(ir * 2))
         gfx.DrawLine(pen, float(icx - ir), float(icy), float(icx + ir), float(icy))
         gfx.DrawLine(pen, float(icx), float(icy - ir), float(icx), float(icy + ir))
         pen.Dispose()
-        return  # nothing else in this mode
+        return  # Nothing else drawn in alignment mode
 
-    # --- Outer circle (red) ---
+    # --- Circles (all modes 0-3) ---
     pen = Pen(OUTER_CIRCLE_COLOR, CIRCLE_PEN_WIDTH)
     gfx.DrawEllipse(pen, float(ocx - ore), float(ocy - ore), float(ore * 2), float(ore * 2))
     pen.Dispose()
 
-    # --- Inner circle (green) ---
     pen = Pen(INNER_CIRCLE_COLOR, CIRCLE_PEN_WIDTH)
     gfx.DrawEllipse(pen, float(icx - ir), float(icy - ir), float(ir * 2), float(ir * 2))
     pen.Dispose()
 
-    # --- Crosshair at outer center (yellow) --- mode 0,1,2
+    # --- Center crosshairs (modes 0-2) ---
+    # Yellow crosshair at outer center, green crosshair at inner center.
+    # These are small fixed-size markers, unlike mode 4's full-diameter ones.
     if mode <= 2:
         pen = Pen(CROSSHAIR_COLOR, CROSSHAIR_PEN_WIDTH)
         ch = float(CROSSHAIR_LENGTH)
@@ -527,14 +620,14 @@ def draw_overlay(gfx, width, height):
         gfx.DrawLine(pen, float(ocx), float(ocy - ch), float(ocx), float(ocy + ch))
         pen.Dispose()
 
-        # Crosshair at inner center (green, smaller)
         pen = Pen(INNER_CIRCLE_COLOR, CROSSHAIR_PEN_WIDTH)
         ch2 = float(CROSSHAIR_LENGTH * 0.6)
         gfx.DrawLine(pen, float(icx - ch2), float(icy), float(icx + ch2), float(icy))
         gfx.DrawLine(pen, float(icx), float(icy - ch2), float(icx), float(icy + ch2))
         pen.Dispose()
 
-    # --- Offset line between centers (cyan dashed) --- mode 0,1,2
+    # --- Offset vector line between centers (modes 0-2) ---
+    # Dashed cyan line from outer center to inner center with arrowhead.
     dx = icx - ocx
     dy = icy - ocy
     offset_dist = math.sqrt(dx * dx + dy * dy)
@@ -548,7 +641,7 @@ def draw_overlay(gfx, width, height):
         gfx.DrawLine(pen, float(ocx), float(ocy), float(icx), float(icy))
         pen.Dispose()
 
-        # Arrowhead on offset line
+        # Arrowhead at the inner-center end of the offset line
         if offset_dist > 3:
             arrow_len = min(12.0, offset_dist * 0.4)
             angle = math.atan2(dy, dx)
@@ -563,16 +656,19 @@ def draw_overlay(gfx, width, height):
                 float(icx + arrow_len * math.cos(a2)), float(icy + arrow_len * math.sin(a2)))
             pen.Dispose()
 
-    # --- Correction arrows outside the outer circle --- all modes
-    min_arrow_threshold = 1.5
-    arrow_gap = 15.0
+    # --- Correction arrows (all modes 0-3) ---
+    # These arrows point in the direction the inner circle needs to MOVE to
+    # become concentric with the outer circle (opposite of the offset vector).
+    # X arrow is placed above the donut, Y arrow to the right.
+    min_arrow_threshold = 1.5  # Don't show arrows for sub-pixel offsets
+    arrow_gap = 15.0           # Gap between outer circle edge and arrow start
     arrow_shaft = 30.0
     arrow_head = 10.0
     arrow_pen_w = 2.5
-    corr_x = -dx
+    corr_x = -dx  # Correction = opposite of offset
     corr_y = -dy
 
-    # X-axis correction arrow
+    # X-axis correction arrow (horizontal, above the donut)
     if abs(corr_x) > min_arrow_threshold:
         ax_sign = 1.0 if corr_x > 0 else -1.0
         ax_y = float(ocy - ore - arrow_gap - 8)
@@ -597,7 +693,7 @@ def draw_overlay(gfx, width, height):
             font.Dispose()
             brush.Dispose()
 
-    # Y-axis correction arrow
+    # Y-axis correction arrow (vertical, right of the donut)
     if abs(corr_y) > min_arrow_threshold:
         ay_sign = 1.0 if corr_y > 0 else -1.0
         ay_x = float(ocx + ore + arrow_gap + 8)
@@ -615,6 +711,7 @@ def draw_overlay(gfx, width, height):
         if mode <= 2:
             font = Font(FontFamily.GenericMonospace, ARROW_LABEL_FONT_SIZE, FontStyle.Bold)
             brush = SolidBrush(OFFSET_LINE_COLOR)
+            # In screen coords +Y is down, but for user display +Y means "up"
             if corr_y < 0:
                 gfx.DrawString("MOVE Y UP", font, brush, float(ay_x + 5), float(ocy - arrow_shaft - 5))
             else:
@@ -622,22 +719,22 @@ def draw_overlay(gfx, width, height):
             font.Dispose()
             brush.Dispose()
 
-    # --- Info panel --- mode 0 only
+    # --- Info panel (mode 0 only) ---
     if mode == 0:
         draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist)
 
-    # --- Bottom bar --- mode 0 and 1
+    # --- Bottom bar (modes 0-1) ---
     if mode <= 1:
         draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore)
 
 
 def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
-    """Draw a clear X/Y offset readout bar at the bottom of the frame."""
+    """Draw the X/Y offset readout bar at the bottom of the frame.
+    Shows correction direction and color-codes severity (green=good, red=bad)."""
     bar_h = float(BOTTOM_BAR_FONT_SIZE + 16)
     bar_y = float(height) - bar_h
     offset_pct = (offset_dist / ore * 100.0) if ore > 0 else 0.0
 
-    # Background
     bg = SolidBrush(Color.FromArgb(200, 0, 0, 0))
     gfx.FillRectangle(bg, RectangleF(0.0, bar_y, float(width), bar_h))
     bg.Dispose()
@@ -645,31 +742,31 @@ def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
     font_lg = Font(FontFamily.GenericMonospace, BOTTOM_BAR_FONT_SIZE, FontStyle.Bold)
     font_sm = Font(FontFamily.GenericMonospace, BOTTOM_BAR_FONT_SIZE - 2.0, FontStyle.Regular)
 
-    # Color-code based on magnitude
     def offset_color(val):
+        """Color-code an offset value: green (< 2%) through red (> 20%)."""
         pct = abs(val) / ore * 100.0 if ore > 0 else 0
         if pct < 2:
-            return Color.FromArgb(255, 0, 255, 0)      # green
+            return Color.FromArgb(255, 0, 255, 0)
         elif pct < 5:
-            return Color.FromArgb(255, 150, 255, 0)     # yellow-green
+            return Color.FromArgb(255, 150, 255, 0)
         elif pct < 10:
-            return Color.FromArgb(255, 255, 255, 0)     # yellow
+            return Color.FromArgb(255, 255, 255, 0)
         elif pct < 20:
-            return Color.FromArgb(255, 255, 150, 0)     # orange
+            return Color.FromArgb(255, 255, 150, 0)
         else:
-            return Color.FromArgb(255, 255, 50, 50)     # red
+            return Color.FromArgb(255, 255, 50, 50)
 
-    # X offset
+    # X offset with correction direction indicator
     x_color = offset_color(dx)
     x_brush = SolidBrush(x_color)
-    x_corr = "<<<" if dx > 0 else ">>>"
+    x_corr = "<<<" if dx > 0 else ">>>"  # Correction = opposite of offset
     if abs(dx) < 1.5:
         x_corr = "OK"
     x_text = "X: %+.1f px  %s" % (-dx, x_corr)
     gfx.DrawString(x_text, font_lg, x_brush, float(width * 0.1), bar_y + 6.0)
     x_brush.Dispose()
 
-    # Y offset (negate so +Y = up for user)
+    # Y offset with correction direction (negate so +Y = up for user)
     y_color = offset_color(dy)
     y_brush = SolidBrush(y_color)
     y_corr = "UP" if dy > 0 else "DN"
@@ -679,7 +776,7 @@ def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
     gfx.DrawString(y_text, font_lg, y_brush, float(width * 0.45), bar_y + 6.0)
     y_brush.Dispose()
 
-    # Total offset
+    # Total offset magnitude
     tot_color = offset_color(offset_dist)
     tot_brush = SolidBrush(tot_color)
     tot_text = "Total: %.1f px (%.1f%%)" % (offset_dist, offset_pct)
@@ -691,19 +788,21 @@ def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
 
 
 def draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist):
-    """Draw the information panel with offset values."""
+    """Draw the detailed info panel at top-left with offset stats and quality rating."""
     dx = icx - ocx
     dy = icy - ocy
     offset_pct = (offset_dist / ore * 100.0) if ore > 0 else 0.0
 
+    # Direction of offset in degrees (0=right, 90=up)
     if offset_dist > 0.5:
-        angle_deg = math.degrees(math.atan2(-dy, dx))
+        angle_deg = math.degrees(math.atan2(-dy, dx))  # Negate Y for screen coords
         if angle_deg < 0:
             angle_deg += 360.0
         dir_str = "%.0f deg" % angle_deg
     else:
         dir_str = "--"
 
+    # Quality rating based on offset as % of outer radius
     if offset_pct < 2:
         quality = "EXCELLENT"
         qcolor = Color.FromArgb(255, 0, 255, 0)
@@ -724,7 +823,7 @@ def draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist
         "COLLIMATION OVERLAY",
         "-------------------",
         "Offset: %.1f px (%.1f%%)" % (offset_dist, offset_pct),
-        "dX: %+.1f  dY: %+.1f" % (dx, -dy),
+        "dX: %+.1f  dY: %+.1f" % (dx, -dy),  # -dy so +Y = up for user
         "Direction: %s" % dir_str,
         "Outer R: %.0f  Inner R: %.0f" % (ore, ir),
         "Quality: %s" % quality,
@@ -745,6 +844,7 @@ def draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist
     y = float(pad + 4)
     for i, line in enumerate(lines):
         if i == 6:
+            # Quality line: "Quality: " in white, value in color
             gfx.DrawString("Quality: ", font, txt_brush, float(pad + 6), y)
             gfx.DrawString("         %s" % quality, font, q_brush, float(pad + 6), y)
         else:
@@ -758,7 +858,7 @@ def draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist
 
 
 def draw_status_text(gfx, text):
-    """Draw a status message at top-left."""
+    """Draw a status message (e.g., 'Searching for donut...') at top-left."""
     font = Font(FontFamily.GenericMonospace, TEXT_FONT_SIZE, FontStyle.Bold)
     brush = SolidBrush(Color.Orange)
     bg = SolidBrush(TEXT_BG_COLOR)
@@ -772,7 +872,7 @@ def draw_status_text(gfx, text):
 
 
 def draw_error_text(gfx, text):
-    """Draw an error message at top-left."""
+    """Draw an error message at top-left (red text on dark background)."""
     font = Font(FontFamily.GenericMonospace, 10.0, FontStyle.Regular)
     brush = SolidBrush(Color.Red)
     bg = SolidBrush(TEXT_BG_COLOR)
@@ -786,9 +886,19 @@ def draw_error_text(gfx, text):
 # =============================================================================
 # FRAME HANDLER
 # =============================================================================
+# This is the core event handler registered on camera.BeforeFrameDisplay.
+# It runs on every frame SharpCap is about to display. The handler:
+#   1. Gets the drawable bitmap (for drawing overlays)
+#   2. Periodically gets the frame bitmap (for pixel analysis)
+#   3. Runs donut analysis on the frame pixels
+#   4. Draws the overlay using current (smoothed) detection state
+#
+# IMPORTANT: All GDI+ resources (Pen, Brush, Font, Graphics, Bitmap) must
+# be Disposed to avoid memory leaks. The finally block ensures cleanup.
 
 def on_before_frame_display(*args):
-    """Called by SharpCap before each frame is displayed."""
+    """BeforeFrameDisplay event handler. Called by SharpCap on every frame."""
+    # Skip if disabled or in "Off" display mode
     if not _state["enabled"] or _state["display_mode"] >= len(_DISPLAY_MODE_NAMES) - 1:
         return
 
@@ -798,6 +908,10 @@ def on_before_frame_display(*args):
 
     try:
         frame = args[1].Frame
+
+        # GetDrawableBitmap returns a wrapper for drawing overlays onto the frame.
+        # GetGraphics() returns a WinformGraphicsImpl (GDI+ wrapper) for drawing.
+        # IMPORTANT: GetBitmap() on this returns the OVERLAY layer, not frame data.
         dbitmap = frame.GetDrawableBitmap()
         if dbitmap is None:
             return
@@ -808,10 +922,11 @@ def on_before_frame_display(*args):
 
         _state["frame_count"] += 1
 
-        # --- Analysis phase (run periodically) ---
+        # --- Analysis phase (runs every ANALYSIS_INTERVAL frames) ---
         if _state["frame_count"] % ANALYSIS_INTERVAL == 0:
             try:
-                # GetFrameBitmap returns the actual frame as a System.Drawing.Bitmap
+                # GetFrameBitmap returns the actual camera frame as a System.Drawing.Bitmap.
+                # We use LockBits to get raw pixel data for analysis.
                 bmp = frame.GetFrameBitmap()
                 if bmp is not None:
                     result = analyze_bitmap(bmp)
@@ -827,11 +942,12 @@ def on_before_frame_display(*args):
                 if _state["frame_count"] <= 5:
                     print("[Collimation] Analysis error: %s" % str(ex))
 
-        # --- Drawing phase (every frame) ---
+        # --- Drawing phase (runs every frame for smooth overlay) ---
         info = frame.Info
         draw_overlay(gfx, info.Width, info.Height)
 
     except Exception as ex:
+        # Try to show the error on-screen so user sees it without the console
         if gfx is not None:
             try:
                 draw_error_text(gfx, "Error: %s" % str(ex))
@@ -841,6 +957,9 @@ def on_before_frame_display(*args):
             print("[Collimation] Handler error: %s" % str(ex))
 
     finally:
+        # Always dispose GDI+ resources to prevent memory leaks.
+        # Order matters: dispose Graphics before the DrawableBitmap.
+        # DrawableBitmap.Dispose() copies the drawn overlay back to the frame.
         if gfx is not None:
             try:
                 gfx.Dispose()
@@ -854,12 +973,19 @@ def on_before_frame_display(*args):
 
 
 def analyze_bitmap(bmp):
-    """Analyze a System.Drawing.Bitmap for the donut pattern."""
+    """
+    Extract raw pixel data from a System.Drawing.Bitmap and run donut analysis.
+
+    Uses LockBits to copy pixel data into a .NET byte array, then calls
+    analyze_donut_raw(). Tries multiple pixel formats for compatibility
+    with different camera types (RGB, ARGB, indexed).
+    """
     width = bmp.Width
     height = bmp.Height
     rect = Rectangle(0, 0, width, height)
 
-    # Try to lock as 24bpp RGB (most compatible), fall back to native format
+    # Try to lock as 24bpp RGB first (most compatible and efficient).
+    # Fall back to other formats if the bitmap doesn't support conversion.
     bmpdata = None
     for fmt in [PixelFormat.Format24bppRgb, PixelFormat.Format32bppArgb,
                 PixelFormat.Format32bppRgb, PixelFormat.Format8bppIndexed]:
@@ -876,18 +1002,18 @@ def analyze_bitmap(bmp):
             _state["last_error"] = "LockBits failed: %s" % str(ex)
             return None
 
+    # Copy pixel data from unmanaged memory to a .NET byte array
     stride = bmpdata.Stride
     total = abs(stride) * height
     raw = Array.CreateInstance(Byte, total)
     Marshal.Copy(bmpdata.Scan0, raw, 0, total)
     bmp.UnlockBits(bmpdata)
 
+    # Compute bytes per pixel from stride (stride may include padding bytes)
     bpp = abs(stride) // width
     if bpp < 1:
         bpp = 1
 
-    # Analyze directly from raw bytes without converting to float array
-    # (avoids slow 480k-iteration Python loop)
     return analyze_donut_raw(raw, abs(stride), bpp, width, height)
 
 
@@ -896,12 +1022,13 @@ def analyze_bitmap(bmp):
 # =============================================================================
 
 def cycle_display_mode():
-    """Cycle through display modes including off. Called by toolbar button."""
+    """Cycle to the next display mode. Called by toolbar button or console."""
     _state["display_mode"] = (_state["display_mode"] + 1) % len(_DISPLAY_MODE_NAMES)
     mode = _state["display_mode"]
     name = _DISPLAY_MODE_NAMES[mode]
     print("[Collimation] Display: %s" % name)
-    # When cycling back from Off to All, reset tracking so it re-acquires
+    # When cycling back from Off to All, reset detection state so it
+    # re-acquires the donut from scratch (position may have changed).
     if mode == 0:
         _state["outer_cx"] = None
         _state["outer_cy"] = None
@@ -913,7 +1040,12 @@ def cycle_display_mode():
 
 
 def diagnose():
-    """Capture one frame and try ALL methods to read pixel data."""
+    """
+    Diagnostic tool: captures one frame and tests all pixel access methods.
+    Prints detailed results to the console. Use this to debug detection
+    issues — it shows what pixel data is actually available and what values
+    the camera is producing.
+    """
     print("[Diag] Capturing frame - testing all pixel access methods...")
 
     _diag = {"done": False, "info": []}
@@ -935,7 +1067,7 @@ def diagnose():
             cx = w // 2
             cy = h // 2
 
-            # --- Method 1: GetPixelValue (direct, should always work) ---
+            # Method 1: Direct pixel value access (SharpCap native)
             info.append("")
             info.append("=== Method 1: GetPixelValue ===")
             try:
@@ -948,14 +1080,13 @@ def diagnose():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # --- Method 2: ToBytes ---
+            # Method 2: Raw byte buffer
             info.append("")
             info.append("=== Method 2: frame.ToBytes() ===")
             try:
                 raw = frame.ToBytes()
                 info.append("  Length: %d (expected mono=%d, rgb=%d)" % (
                     len(raw), w * h, w * h * 3))
-                # Sample center pixel
                 bpp_guess = len(raw) // (w * h)
                 info.append("  Implied BPP: %d" % bpp_guess)
                 if bpp_guess >= 1:
@@ -964,11 +1095,10 @@ def diagnose():
                     if bpp_guess >= 3:
                         val = (raw[off] + raw[off+1] + raw[off+2]) / 3.0
                     elif bpp_guess == 2:
-                        val = raw[off] + raw[off+1] * 256.0  # 16-bit LE
+                        val = raw[off] + raw[off+1] * 256.0
                     else:
                         val = float(raw[off])
                     info.append("  center pixel: %.1f" % val)
-                    # Check a few more
                     off2 = 10 * stride_guess + 10 * bpp_guess
                     if bpp_guess >= 3:
                         val2 = (raw[off2] + raw[off2+1] + raw[off2+2]) / 3.0
@@ -980,7 +1110,7 @@ def diagnose():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # --- Method 3: GetFrameBitmap ---
+            # Method 3: Frame as System.Drawing.Bitmap (THIS IS WHAT WE USE)
             info.append("")
             info.append("=== Method 3: frame.GetFrameBitmap() ===")
             try:
@@ -988,7 +1118,6 @@ def diagnose():
                 info.append("  Result: %s (type: %s)" % (fbmp, type(fbmp)))
                 if fbmp is not None:
                     info.append("  Size: %dx%d, Format: %s" % (fbmp.Width, fbmp.Height, fbmp.PixelFormat))
-                    # Sample pixel
                     px = fbmp.GetPixel(cx, cy)
                     info.append("  center pixel: R=%d G=%d B=%d A=%d" % (px.R, px.G, px.B, px.A))
                     px2 = fbmp.GetPixel(cx + w // 4, cy)
@@ -996,7 +1125,7 @@ def diagnose():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # --- Method 4: CreateBitmap ---
+            # Method 4: CreateBitmap (requires args in some versions)
             info.append("")
             info.append("=== Method 4: frame.CreateBitmap() ===")
             try:
@@ -1009,7 +1138,7 @@ def diagnose():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # --- Method 5: GetDrawableBitmap().GetBitmap() (overlay layer) ---
+            # Method 5: Overlay layer (expected to be blank - included for reference)
             info.append("")
             info.append("=== Method 5: GetDrawableBitmap().GetBitmap() ===")
             try:
@@ -1021,7 +1150,7 @@ def diagnose():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # --- Method 6: GetBufferLease ---
+            # Method 6: Raw memory buffer
             info.append("")
             info.append("=== Method 6: frame.GetBufferLease() ===")
             try:
@@ -1051,7 +1180,7 @@ def diagnose():
 
 
 def reset_tracking():
-    """Force re-detection of the donut."""
+    """Clear detection state and force re-acquisition of the donut."""
     _state["outer_cx"] = None
     _state["outer_cy"] = None
     _state["outer_r"] = None
@@ -1063,10 +1192,11 @@ def reset_tracking():
 
 
 def show_state():
-    """Print current detection state for debugging."""
+    """Print current detection state and last error to the console."""
     print("[Collimation] State:")
     print("  enabled: %s" % _state["enabled"])
     print("  status: %s" % _state["status"])
+    print("  display_mode: %d (%s)" % (_state["display_mode"], _DISPLAY_MODE_NAMES[_state["display_mode"]]))
     print("  frames: %d" % _state["frame_count"])
     print("  outer: cx=%.1f cy=%.1f r=%.1f" % (
         _state["outer_cx"] or 0, _state["outer_cy"] or 0, _state["outer_r"] or 0))
@@ -1078,6 +1208,9 @@ def show_state():
 # =============================================================================
 # TEST MODE - synthetic donut for verifying the pipeline
 # =============================================================================
+# These functions let you test the detection algorithm without a real camera.
+# test_synthetic() generates a fake donut image; test_image() loads a file.
+# Both update _state so the overlay draws on the next live frame.
 
 def test_synthetic(width=800, height=600, outer_r=220, inner_r=90,
                    offset_x=15, offset_y=-10):
@@ -1099,35 +1232,27 @@ def test_synthetic(width=800, height=600, outer_r=220, inner_r=90,
     icx = cx + offset_x
     icy = cy + offset_y
 
-    # Build float array with donut pattern
+    # Build float array with donut pattern (soft edges + diffraction rings)
     pixels = []
     for y in range(height):
         for x in range(width):
-            # Distance from outer center
             dx = x - cx
             dy = y - cy
             dist_outer = math.sqrt(dx * dx + dy * dy)
 
-            # Distance from inner center
             dxi = x - icx
             dyi = y - icy
             dist_inner = math.sqrt(dxi * dxi + dyi * dyi)
 
-            # Donut: bright between inner_r and outer_r
             if dist_inner < inner_r:
-                # Dark center (secondary shadow)
-                val = 5.0
+                val = 5.0  # Dark center (secondary shadow)
             elif dist_outer < outer_r:
-                # Bright ring with soft edges
-                # Fade in from inner edge
                 inner_fade = min(1.0, (dist_inner - inner_r) / 15.0) if dist_inner > inner_r else 0.0
-                # Fade out toward outer edge
                 outer_fade = min(1.0, (outer_r - dist_outer) / 20.0) if dist_outer < outer_r else 0.0
                 val = 200.0 * inner_fade * outer_fade
-                # Add some diffraction ring pattern
                 val += 30.0 * max(0, math.cos(dist_outer * 0.3)) * inner_fade * outer_fade
             else:
-                val = 2.0
+                val = 2.0  # Dark background
 
             pixels.append(max(0.0, val))
 
@@ -1136,7 +1261,6 @@ def test_synthetic(width=800, height=600, outer_r=220, inner_r=90,
 
     if result is None:
         print("[Test] FAILED - analysis returned None")
-        print("[Test] This means edge detection couldn't find the donut.")
         return
 
     print("[Test] SUCCESS!")
@@ -1151,7 +1275,6 @@ def test_synthetic(width=800, height=600, outer_r=220, inner_r=90,
     expected_offset = math.sqrt(offset_x * offset_x + offset_y * offset_y)
     print("[Test] Detected offset: %.1f px (expected: %.1f px)" % (offset, expected_offset))
 
-    # Apply to state so overlay draws on next frame
     update_state_with_result(result)
     _state["status"] = "Test mode"
     print("[Test] State updated - overlay should now draw on the live view!")
@@ -1199,14 +1322,15 @@ def test_image(path):
 # =============================================================================
 
 def _make_icon(icon_type):
-    """Create a 24x24 toolbar icon bitmap."""
+    """Create a 24x24 toolbar icon bitmap using GDI+ drawing.
+    Uses System.Drawing.Graphics directly (not the SharpCap wrapper)."""
     size = 24
     bmp = Bitmap(size, size)
     g = System.Drawing.Graphics.FromImage(bmp)
     g.Clear(Color.Transparent)
 
     if icon_type == "toggle":
-        # Concentric circles: red outer, green inner, yellow center dot
+        # Concentric circles icon: red outer, green inner, yellow center dot
         p = Pen(Color.FromArgb(255, 220, 60, 60), 2.0)
         g.DrawEllipse(p, 2, 2, 19, 19)
         p.Dispose()
@@ -1218,11 +1342,10 @@ def _make_icon(icon_type):
         b.Dispose()
 
     elif icon_type == "reset":
-        # Circular arrow (refresh symbol)
+        # Circular arrow icon (refresh symbol)
         p = Pen(Color.FromArgb(255, 100, 180, 255), 2.0)
         g.DrawArc(p, 4, 4, 15, 15, 0, 270)
         p.Dispose()
-        # Arrowhead
         p = Pen(Color.FromArgb(255, 100, 180, 255), 2.0)
         g.DrawLine(p, 11.0, 4.0, 19.0, 4.0)
         g.DrawLine(p, 19.0, 4.0, 19.0, 10.0)
@@ -1233,7 +1356,7 @@ def _make_icon(icon_type):
 
 
 def attach_handler():
-    """Attach the overlay handler to the camera."""
+    """Register the overlay event handler on the selected camera."""
     if _state["handler_attached"]:
         print("[Collimation] Handler already attached")
         return
@@ -1249,7 +1372,7 @@ def attach_handler():
 
 
 def detach_handler():
-    """Remove the overlay handler from the camera."""
+    """Unregister the overlay event handler from the camera."""
     if not _state["handler_attached"]:
         print("[Collimation] No handler to detach")
         return
@@ -1264,7 +1387,7 @@ def detach_handler():
 
 
 def stop():
-    """Fully stop the overlay: detach handler, remove buttons, clean up."""
+    """Fully stop the overlay: detach handler, remove toolbar button, disable."""
     detach_handler()
     for btn_name in _state.get("buttons", []):
         try:
@@ -1278,12 +1401,19 @@ def stop():
 
 
 def setup():
-    """Initialize the collimation overlay."""
+    """
+    Initialize the collimation overlay:
+      1. Add the "Coll Overlay" toolbar button
+      2. Attach the BeforeFrameDisplay handler to the camera
+      3. Print usage instructions to the console
+    """
     print("=" * 50)
     print("  COLLIMATION OVERLAY v3")
     print("=" * 50)
 
-    # Single toolbar button that cycles display modes
+    # Add a single toolbar button that cycles through display modes.
+    # SharpCap's AddCustomButton takes 4 args but the ordering varies by
+    # version, so we try 3 possible orderings and use whichever works.
     btn_name = "Coll Overlay"
     icon = _make_icon("toggle")
     btn_added = False
@@ -1326,5 +1456,8 @@ def setup():
 # =============================================================================
 # AUTO-START
 # =============================================================================
+# When this script is executed (via File > Run Script or exec()), setup()
+# runs automatically, registering the handler and creating the toolbar button.
+# The script then exits, but the handler remains active on every frame.
 
 setup()

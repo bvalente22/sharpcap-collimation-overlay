@@ -50,6 +50,7 @@
 #   2. Defocus a bright star until you see a donut shape
 #   3. Tools > Scripting Console > File > Run Script > select this file
 #   4. Click "Coll Overlay" toolbar button to cycle display modes
+#   5. Click "Coll Settings" toolbar button to open the settings palette
 #
 # Requires: SharpCap Pro 4.1+ (scripting is a Pro feature)
 # =============================================================================
@@ -57,12 +58,13 @@
 import clr
 import math
 import time
+import os as _os
 
 # .NET assemblies for drawing and pixel access
 clr.AddReference("System.Drawing")
 from System.Drawing import (
     Color, Pen, SolidBrush, Font, FontFamily, FontStyle,
-    Bitmap, Rectangle, RectangleF, PointF,
+    Bitmap, Rectangle, RectangleF, PointF, StringFormat,
 )
 from System.Drawing.Imaging import ImageLockMode, PixelFormat
 from System.Drawing.Drawing2D import SmoothingMode, DashStyle
@@ -70,68 +72,179 @@ from System.Runtime.InteropServices import Marshal
 from System import Array, Byte
 import System.Drawing
 
+# .NET WinForms for settings dialog
+clr.AddReference("System.Windows.Forms")
+from System.Windows.Forms import (
+    Form, TabControl, TabPage, Label, NumericUpDown, TrackBar,
+    Button, Panel, ColorDialog, ToolTip, DockStyle, Padding,
+    FormBorderStyle, FormStartPosition, AnchorStyles,
+    TickStyle, Orientation, MessageBox, MessageBoxButtons,
+    MessageBoxIcon, DialogResult, AutoScaleMode as WinFormsAutoScaleMode,
+)
+
 # =============================================================================
-# USER CONFIGURATION
+# CONFIGURATION SYSTEM
 # =============================================================================
-# Edit these values to customize the overlay appearance and behavior.
-# All colors use ARGB format: Color.FromArgb(alpha, red, green, blue)
+# All settings are stored in _config dict, populated from _DEFAULTS on startup
+# and optionally overridden by a saved config file. The settings dialog and
+# console commands modify _config directly — changes take effect on the next frame.
 
-# Overlay colors
-OUTER_CIRCLE_COLOR = Color.FromArgb(220, 255, 60, 60)     # Red - primary mirror edge
-INNER_CIRCLE_COLOR = Color.FromArgb(220, 60, 255, 60)     # Green - secondary shadow edge
-CROSSHAIR_COLOR    = Color.FromArgb(180, 255, 255, 0)     # Yellow - outer center marker
-OFFSET_LINE_COLOR  = Color.FromArgb(220, 0, 220, 255)     # Cyan - offset vector & arrows
-TEXT_COLOR          = Color.FromArgb(240, 255, 255, 255)   # White - info panel text
-TEXT_BG_COLOR       = Color.FromArgb(160, 0, 0, 0)         # Semi-transparent black background
+# Default values for all configuration options.
+# Colors stored as (A, R, G, B) tuples for serialization.
+_DEFAULTS = {
+    # Overlay colors (ARGB)
+    "OUTER_CIRCLE_COLOR": (220, 255, 60, 60),      # Red - primary mirror edge
+    "INNER_CIRCLE_COLOR": (220, 60, 255, 60),       # Green - secondary shadow edge
+    "CROSSHAIR_COLOR":    (180, 255, 255, 0),       # Yellow - outer center marker
+    "OFFSET_LINE_COLOR":  (220, 0, 220, 255),       # Cyan - offset vector & arrows
+    "TEXT_COLOR":          (240, 255, 255, 255),     # White - info panel text
+    "TEXT_BG_COLOR":       (160, 0, 0, 0),           # Semi-transparent black background
+    # Line widths (pixels)
+    "CIRCLE_PEN_WIDTH":    2.0,
+    "CROSSHAIR_PEN_WIDTH": 1.0,
+    "OFFSET_PEN_WIDTH":    2.0,
+    # Crosshair size (pixels extending from center, used in modes 0-2)
+    "CROSSHAIR_LENGTH": 20,
+    # Text sizes (points)
+    "TEXT_FONT_SIZE":        9,
+    "BOTTOM_BAR_FONT_SIZE": 10,
+    "ARROW_LABEL_FONT_SIZE": 8,
+    # Detection parameters
+    "NUM_RAYS":                    90,   # Radial rays for edge detection
+    "BRIGHTNESS_THRESHOLD_PERCENT": 30,  # % of peak brightness defining donut edge
+    "CENTROID_DOWNSAMPLE":          4,   # Sample every Nth pixel for centroid
+    "MIN_DONUT_RADIUS":            15,   # Ignore circles smaller than this (px)
+    "RAY_STEP":                     1,   # Pixel step along each ray
+    "ROI_MARGIN_FACTOR":          2.0,   # CutROI margin as multiple of outer radius
+    # Tracking validation
+    "MAX_RADIUS_CHANGE_PCT": 15,         # Max % change in outer radius per detection
+    "MAX_CENTER_JUMP_PCT":   20,         # Max center jump as % of outer radius
+    "STALE_FRAME_LIMIT":    15,          # Consecutive rejections before re-detect
+    # Smoothing
+    "SMOOTHING_FACTOR": 0.6,             # EMA factor (0.0 = none, 0.9 = heavy)
+    # Performance
+    "ANALYSIS_INTERVAL": 2,              # Analyze every Nth frame
+}
 
-# Line widths (in pixels)
-CIRCLE_PEN_WIDTH    = 2.0
-CROSSHAIR_PEN_WIDTH = 1.0
-OFFSET_PEN_WIDTH    = 2.0
+# Color keys are identified by suffix for serialization
+_COLOR_KEYS = frozenset(k for k in _DEFAULTS if k.endswith("_COLOR"))
 
-# Crosshair size (pixels extending from center, used in modes 0-2)
-CROSSHAIR_LENGTH = 20
+# Float keys (non-integer numeric)
+_FLOAT_KEYS = frozenset(["CIRCLE_PEN_WIDTH", "CROSSHAIR_PEN_WIDTH", "OFFSET_PEN_WIDTH",
+                          "ROI_MARGIN_FACTOR", "SMOOTHING_FACTOR"])
 
-# Text sizes (in points)
-TEXT_FONT_SIZE = 9              # Info panel and status text
-BOTTOM_BAR_FONT_SIZE = 10      # Bottom bar offset readout
-ARROW_LABEL_FONT_SIZE = 8      # Correction arrow labels (MOVE X/Y)
+# Live config dict — read by the frame handler on every frame
+_config = {}
 
-# Detection parameters
-NUM_RAYS = 90                       # Radial rays for edge detection. More = accurate, slower.
-BRIGHTNESS_THRESHOLD_PERCENT = 30   # % of peak brightness that defines the donut edge.
-                                    # Lower = more sensitive (picks up faint edges).
-                                    # Higher = stricter (only bright edges).
-CENTROID_DOWNSAMPLE = 4             # Sample every Nth pixel when computing centroid.
-                                    # Higher = faster but less precise initial center.
-MIN_DONUT_RADIUS = 15               # Ignore detected circles smaller than this (pixels).
-RAY_STEP = 1                        # Pixel step along each ray. 1 = every pixel.
-ROI_MARGIN_FACTOR = 2.0             # CutROI margin as multiple of outer radius.
-                                    # 2.0 = 100% padding around the donut for tracking.
 
-# Tracking validation: reject new detections that differ too much from
-# the current smoothed state. Prevents drift from bad frames.
-MAX_RADIUS_CHANGE_PCT = 15          # Max % change in outer radius per detection.
-MAX_CENTER_JUMP_PCT = 20            # Max center jump as % of outer radius.
-STALE_FRAME_LIMIT = 15              # After this many consecutive rejected frames,
-                                    # force a full re-detection from scratch.
+def _tuple_to_color(t):
+    """Convert (A, R, G, B) tuple to System.Drawing.Color."""
+    return Color.FromArgb(int(t[0]), int(t[1]), int(t[2]), int(t[3]))
 
-# Smoothing: exponential moving average applied to circle positions/radii.
-# 0.0 = no smoothing (instant response, may jitter)
-# 0.9 = heavy smoothing (very stable, slow to respond to changes)
-SMOOTHING_FACTOR = 0.6
 
-# Analyze every Nth frame. Higher = less CPU but slower response.
-# 1 = every frame, 2 = every other frame, etc.
-ANALYSIS_INTERVAL = 2
+def _color_to_tuple(c):
+    """Convert System.Drawing.Color to (A, R, G, B) tuple."""
+    return (c.A, c.R, c.G, c.B)
+
+
+def _init_config():
+    """Populate _config from _DEFAULTS, converting color tuples to Color objects."""
+    for key, val in _DEFAULTS.items():
+        if key in _COLOR_KEYS:
+            _config[key] = _tuple_to_color(val)
+        else:
+            _config[key] = val
+
+
+def _get_config_path():
+    """Return the path to the settings file (next to the script)."""
+    try:
+        script_dir = _os.path.dirname(_os.path.abspath(__file__))
+    except NameError:
+        script_dir = "."
+    return _os.path.join(script_dir, "collimation_settings.cfg")
+
+
+def save_config():
+    """Save current _config to the settings file."""
+    path = _get_config_path()
+    try:
+        lines = ["# Collimation Overlay Settings", "# Edit with care or use the Settings dialog", ""]
+        for key in sorted(_DEFAULTS.keys()):
+            val = _config.get(key)
+            if val is None:
+                continue
+            if key in _COLOR_KEYS:
+                t = _color_to_tuple(val)
+                lines.append("%s = %d,%d,%d,%d" % (key, t[0], t[1], t[2], t[3]))
+            elif key in _FLOAT_KEYS:
+                lines.append("%s = %.2f" % (key, val))
+            else:
+                lines.append("%s = %s" % (key, val))
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print("[Collimation] Settings saved to: %s" % path)
+    except Exception as ex:
+        print("[Collimation] Error saving settings: %s" % str(ex))
+
+
+def load_config():
+    """Load settings from file, overlaying onto current _config."""
+    path = _get_config_path()
+    if not _os.path.exists(path):
+        return
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip()
+                if key not in _DEFAULTS:
+                    continue
+                try:
+                    if key in _COLOR_KEYS:
+                        parts = [int(x.strip()) for x in val.split(",")]
+                        if len(parts) == 4:
+                            _config[key] = Color.FromArgb(parts[0], parts[1], parts[2], parts[3])
+                    elif key in _FLOAT_KEYS:
+                        _config[key] = float(val)
+                    else:
+                        _config[key] = int(val)
+                except:
+                    pass  # Skip malformed values, keep default
+        print("[Collimation] Settings loaded from: %s" % path)
+    except Exception as ex:
+        print("[Collimation] Error loading settings: %s" % str(ex))
+
+
+def reset_config():
+    """Reset all settings to defaults and delete the config file."""
+    _init_config()
+    path = _get_config_path()
+    try:
+        if _os.path.exists(path):
+            _os.remove(path)
+    except:
+        pass
+    print("[Collimation] Settings reset to defaults")
+
+
+# Initialize config from defaults, then overlay with saved file
+_init_config()
+load_config()
+
 
 # =============================================================================
 # INTERNAL STATE
 # =============================================================================
 
-# If the script is re-run, clean up the previous instance's event handler
-# and toolbar buttons to prevent duplicates. This works because IronPython
-# keeps global variables alive across script runs in the same console session.
+# If the script is re-run, clean up the previous instance's event handler,
+# toolbar buttons, and settings form to prevent duplicates.
 try:
     _prev_state = _state
     if _prev_state.get("handler_attached"):
@@ -144,6 +257,14 @@ try:
     for btn_name in _prev_state.get("buttons", []):
         try:
             SharpCap.RemoveCustomButton(btn_name)
+        except:
+            pass
+    # Close settings form if open
+    sf = _prev_state.get("settings_form")
+    if sf is not None:
+        try:
+            sf.Close()
+            sf.Dispose()
         except:
             pass
     print("[Collimation] Cleaned up previous instance")
@@ -167,6 +288,7 @@ _state = {
     "reject_count": 0,      # Consecutive rejected detection count
     "debug_log": False,     # Toggle with debug_on() / debug_off()
     "debug_frames": 0,      # Frames logged since debug enabled
+    "settings_form": None,  # Reference to open SettingsForm
 }
 
 # Display modes cycled by the toolbar button. The last mode ("Off") disables
@@ -238,7 +360,7 @@ def fit_circle(points):
         sum_r2 += dx * dx + dy * dy
     radius = math.sqrt(sum_r2 / n) if sum_r2 > 0 else 0
 
-    if radius < MIN_DONUT_RADIUS * 0.5:
+    if radius < _config["MIN_DONUT_RADIUS"] * 0.5:
         return None
 
     return (cx, cy, radius)
@@ -313,20 +435,19 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         Dict with inner/outer circle parameters, or None if no donut found.
     """
     # --- Step 1: Determine peak brightness and approximate center ---
-    step = CENTROID_DOWNSAMPLE
+    step = _config["CENTROID_DOWNSAMPLE"]
+    brightness_thresh_pct = _config["BRIGHTNESS_THRESHOLD_PERCENT"]
+
     if peak_override is not None and approx_center is not None:
         # Fastest path: both peak and center provided (histogram + tracking).
-        # Skip the pixel scan entirely.
         peak = peak_override
-        # Use reference peak as floor to prevent threshold collapse when dimming
         ref = _state.get("ref_peak")
         if ref is not None:
             peak = max(peak, ref * 0.5)
-        threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
+        threshold = peak * brightness_thresh_pct / 100.0
         approx_cx, approx_cy = approx_center
     elif approx_center is not None:
-        # ROI path: center known from tracking, but scan pixels for accurate
-        # peak brightness. Used with CutROI where the scan is on a small region.
+        # ROI path: center known from tracking, but scan pixels for accurate peak.
         approx_cx, approx_cy = approx_center
         peak = 0.0
         for y in range(0, height, step):
@@ -337,11 +458,10 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
                     peak = b
         if peak < 25.0:
             return None
-        # Use reference peak as floor to prevent threshold collapse when dimming
         ref = _state.get("ref_peak")
         if ref is not None:
             peak = max(peak, ref * 0.5)
-        threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
+        threshold = peak * brightness_thresh_pct / 100.0
     else:
         # Standard path: scan every Nth pixel for peak brightness and
         # brightness-weighted centroid. Used for initial detection.
@@ -366,11 +486,9 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
 
         approx_cx = sum_bx / sum_b
         approx_cy = sum_by / sum_b
-        threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
+        threshold = peak * brightness_thresh_pct / 100.0
 
     # --- Step 2: Refine center using only bright pixels near the centroid ---
-    # The coarse centroid can be pulled off by background gradients. Here we
-    # restrict to a region around the initial estimate and only use bright pixels.
     search_r = int(min(width, height) * 0.3)
     x_min = max(0, int(approx_cx) - search_r)
     x_max = min(width, int(approx_cx) + search_r)
@@ -396,21 +514,15 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         approx_cy = sum_by2 / sum_b2
 
     # --- Step 3: Cast rays outward from center to find inner/outer edges ---
-    # Each ray walks pixel-by-pixel from the center outward, looking for
-    # brightness transitions. The first dark->bright transition is the inner
-    # edge (boundary of the secondary shadow).
-    #
-    # For the outer edge, instead of a single-pixel threshold crossing (which
-    # is very noisy on dim images), we find the point of steepest brightness
-    # decline. This is robust to absolute brightness variations because it
-    # detects the edge shape rather than an absolute level.
     inner_points = []
     outer_points = []
     max_ray_len = int(min(width, height) * 0.45)
     grad_window = 5  # Pixels to average for gradient calculation
+    num_rays = _config["NUM_RAYS"]
+    ray_step = _config["RAY_STEP"]
 
-    for i in range(NUM_RAYS):
-        angle = 2.0 * math.pi * i / NUM_RAYS
+    for i in range(num_rays):
+        angle = 2.0 * math.pi * i / num_rays
         cos_a = math.cos(angle)
         sin_a = math.sin(angle)
 
@@ -418,7 +530,7 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         in_bright = False
         ray_samples = []  # (dist, px, py, brightness) collected after inner edge
 
-        for dist in range(3, max_ray_len, RAY_STEP):
+        for dist in range(3, max_ray_len, ray_step):
             px = int(approx_cx + cos_a * dist)
             py = int(approx_cy + sin_a * dist)
 
@@ -440,17 +552,12 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
 
             # Stop collecting well past the expected outer edge
             if found_inner and not is_bright and len(ray_samples) > grad_window * 2:
-                # Continue a bit past the first dark pixel to capture the full gradient
                 pass
             if found_inner and not is_bright and len(ray_samples) > grad_window * 3:
-                # We're past the bright region and have enough samples for
-                # gradient calculation. Stop once brightness is very low.
                 if b < 5.0:
                     break
 
         # Find outer edge as point of steepest RELATIVE brightness decline.
-        # Using relative gradient (pct drop) instead of absolute ensures that
-        # dim parts of the donut find the edge just as reliably as bright parts.
         if found_inner and len(ray_samples) > grad_window * 2:
             best_grad = 0.0
             best_idx = -1
@@ -462,7 +569,6 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
                     avg_after += ray_samples[j + k][3]
                 avg_before /= grad_window
                 avg_after /= grad_window
-                # Relative gradient: fraction of brightness that drops
                 if avg_before > 1.0:
                     grad = (avg_before - avg_after) / avg_before
                 else:
@@ -496,9 +602,10 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
     ocx, ocy, ore = outer_fit
 
     # --- Sanity checks ---
+    min_donut_r = _config["MIN_DONUT_RADIUS"]
     if ir >= ore:
         return None  # Inner can't be larger than outer
-    if ir < MIN_DONUT_RADIUS * 0.3:
+    if ir < min_donut_r * 0.3:
         return None  # Inner circle too small to be real
     center_dist = math.sqrt((icx - ocx) ** 2 + (icy - ocy) ** 2)
     if center_dist > ore * 0.5:
@@ -528,15 +635,18 @@ def analyze_donut_floats(pixels, width, height):
     Same algorithm as analyze_donut_raw but for a flat float array
     (one float per pixel). Used by test_synthetic() which generates
     float data. Not used in live mode (live uses raw bytes from LockBits).
-
-    pixels: Python list or .NET float array, length = width * height
     """
+    step = _config["CENTROID_DOWNSAMPLE"]
+    brightness_thresh_pct = _config["BRIGHTNESS_THRESHOLD_PERCENT"]
+    num_rays = _config["NUM_RAYS"]
+    ray_step = _config["RAY_STEP"]
+    min_donut_r = _config["MIN_DONUT_RADIUS"]
+
     # --- Step 1: Find peak brightness and brightness-weighted centroid ---
     sum_bx = 0.0
     sum_by = 0.0
     sum_b  = 0.0
     peak   = 0.0
-    step   = CENTROID_DOWNSAMPLE
 
     for y in range(0, height, step):
         row_off = y * width
@@ -556,7 +666,7 @@ def analyze_donut_floats(pixels, width, height):
     approx_cx = sum_bx / sum_b
     approx_cy = sum_by / sum_b
 
-    threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
+    threshold = peak * brightness_thresh_pct / 100.0
 
     # --- Step 2: Refine center using bright pixels near the centroid ---
     search_r = int(min(width, height) * 0.3)
@@ -589,8 +699,8 @@ def analyze_donut_floats(pixels, width, height):
     max_ray_len = int(min(width, height) * 0.45)
     grad_window = 5
 
-    for i in range(NUM_RAYS):
-        angle = 2.0 * math.pi * i / NUM_RAYS
+    for i in range(num_rays):
+        angle = 2.0 * math.pi * i / num_rays
         cos_a = math.cos(angle)
         sin_a = math.sin(angle)
 
@@ -598,7 +708,7 @@ def analyze_donut_floats(pixels, width, height):
         in_bright = False
         ray_samples = []
 
-        for dist in range(3, max_ray_len, RAY_STEP):
+        for dist in range(3, max_ray_len, ray_step):
             px = int(approx_cx + cos_a * dist)
             py = int(approx_cy + sin_a * dist)
 
@@ -662,7 +772,7 @@ def analyze_donut_floats(pixels, width, height):
 
     if ir >= ore:
         return None
-    if ir < MIN_DONUT_RADIUS * 0.3:
+    if ir < min_donut_r * 0.3:
         return None
     center_dist = math.sqrt((icx - ocx) ** 2 + (icy - ocy) ** 2)
     if center_dist > ore * 0.5:
@@ -678,8 +788,6 @@ def analyze_donut_floats(pixels, width, height):
 # =============================================================================
 # SMOOTHING
 # =============================================================================
-# Exponential moving average to stabilize circle positions across frames.
-# Without smoothing, the overlay can jitter due to noise in edge detection.
 
 def smooth_val(old, new, factor):
     """Apply exponential smoothing: result = old*factor + new*(1-factor)."""
@@ -689,33 +797,27 @@ def smooth_val(old, new, factor):
 
 
 def _validate_detection(result):
-    """Check if a new detection is consistent with the current smoothed state.
-    Returns True if the result should be accepted, False if it should be rejected.
-    Always accepts when there is no previous state (initial detection)."""
+    """Check if a new detection is consistent with the current smoothed state."""
     old_r = _state["outer_r"]
     if old_r is None:
         return True  # No previous state, accept anything
 
-    # Check outer radius didn't change too much
     new_r = result["outer_r"]
     radius_change_pct = abs(new_r - old_r) / old_r * 100.0
-    if radius_change_pct > MAX_RADIUS_CHANGE_PCT:
+    if radius_change_pct > _config["MAX_RADIUS_CHANGE_PCT"]:
         return False
 
-    # Check outer center didn't jump too far
     dx = result["outer_cx"] - _state["outer_cx"]
     dy = result["outer_cy"] - _state["outer_cy"]
     center_jump = math.sqrt(dx * dx + dy * dy)
-    if center_jump > old_r * MAX_CENTER_JUMP_PCT / 100.0:
+    if center_jump > old_r * _config["MAX_CENTER_JUMP_PCT"] / 100.0:
         return False
 
     return True
 
 
 def update_state_with_result(result):
-    """Validate and apply smoothing to new analysis results.
-    Rejects detections that differ too much from the current state.
-    After too many consecutive rejections, forces a full re-detection."""
+    """Validate and apply smoothing to new analysis results."""
     is_debug = _state.get("debug_log", False)
 
     if not _validate_detection(result):
@@ -726,7 +828,7 @@ def update_state_with_result(result):
                 result["outer_r"], result.get("outer_spread", 0),
                 result["outer_cx"], result["outer_cy"],
                 _state["outer_r"] or 0, _state["outer_cx"] or 0))
-        if _state["reject_count"] >= STALE_FRAME_LIMIT:
+        if _state["reject_count"] >= _config["STALE_FRAME_LIMIT"]:
             _state["outer_cx"] = None
             _state["outer_cy"] = None
             _state["outer_r"] = None
@@ -742,7 +844,7 @@ def update_state_with_result(result):
         return
 
     _state["reject_count"] = 0
-    f = SMOOTHING_FACTOR
+    f = _config["SMOOTHING_FACTOR"]
 
     if is_debug:
         old_or = _state["outer_r"]
@@ -782,20 +884,12 @@ def update_state_with_result(result):
 # =============================================================================
 # HISTOGRAM AND ROI HELPERS
 # =============================================================================
-# These use SharpCap APIs revealed by the author to avoid expensive IronPython
-# pixel loops and full-frame buffer copies when possible.
 
 def _get_histogram_peak(frame):
-    """Get approximate peak brightness from frame histogram (native, fast).
-    Uses GetCentilePointsF(99.9) which returns a per-channel array of floats.
-    Averages the first 3 channels (RGB) to match _get_brightness() behavior,
-    which computes (R+G+B)/3. For mono cameras (1 channel), returns that value."""
+    """Get approximate peak brightness from frame histogram (native, fast)."""
     try:
         hist = frame.CalculateHistogram()
         vals = hist.GetCentilePointsF(99.9)
-        # vals is Array[Single] with one entry per channel (e.g., RGBA=4 values).
-        # Average the first 3 (RGB), skipping channel 4 (alpha/luminance) which
-        # can be much higher and would inflate the threshold.
         n = min(3, len(vals))
         total = 0.0
         for i in range(n):
@@ -807,14 +901,10 @@ def _get_histogram_peak(frame):
 
 
 def _try_cut_roi(frame):
-    """Cut a region of interest around the tracked donut position.
-    Returns (roi_frame, offset_x, offset_y) or (None, 0, 0) on failure.
-    Caller MUST call roi_frame.Release() when done."""
+    """Cut a region of interest around the tracked donut position."""
     try:
-        # Use reference radius (from initial detection) for ROI sizing to prevent
-        # feedback loop where shrinking radius -> smaller ROI -> fewer rays -> smaller radius
         roi_r = _state.get("ref_outer_r") or _state["outer_r"]
-        margin = int(roi_r * ROI_MARGIN_FACTOR)
+        margin = int(roi_r * _config["ROI_MARGIN_FACTOR"])
         info = frame.Info
         roi_x = max(0, int(_state["outer_cx"]) - margin)
         roi_y = max(0, int(_state["outer_cy"]) - margin)
@@ -832,12 +922,6 @@ def _try_cut_roi(frame):
 # =============================================================================
 # OVERLAY DRAWING
 # =============================================================================
-# All drawing uses SharpCap's WinformGraphicsImpl wrapper, obtained via
-# frame.GetDrawableBitmap().GetGraphics(). This wrapper supports standard
-# GDI+ drawing methods (DrawEllipse, DrawLine, DrawString, FillRectangle)
-# but FillRectangle requires a RectangleF object instead of separate x/y/w/h.
-# SmoothingMode and DashStyle are wrapped in try/except as they may not be
-# supported on all wrapper versions.
 
 def draw_overlay(gfx, width, height):
     """Main overlay drawing function. Respects current display_mode."""
@@ -860,58 +944,50 @@ def draw_overlay(gfx, width, height):
         return
 
     # --- Mode 4: Alignment crosshairs ---
-    # Draws both circles with full-diameter crosshairs in their respective
-    # colors. When collimation is perfect, the red and green crosshairs
-    # overlap exactly. This is a minimal mode for precise visual alignment.
     if mode == 4:
-        # Outer circle + full-diameter crosshair in red
-        pen = Pen(OUTER_CIRCLE_COLOR, CIRCLE_PEN_WIDTH)
+        pen = Pen(_config["OUTER_CIRCLE_COLOR"], _config["CIRCLE_PEN_WIDTH"])
         gfx.DrawEllipse(pen, float(ocx - ore), float(ocy - ore), float(ore * 2), float(ore * 2))
         gfx.DrawLine(pen, float(ocx - ore), float(ocy), float(ocx + ore), float(ocy))
         gfx.DrawLine(pen, float(ocx), float(ocy - ore), float(ocx), float(ocy + ore))
         pen.Dispose()
 
-        # Inner circle + full-diameter crosshair in green
-        pen = Pen(INNER_CIRCLE_COLOR, CIRCLE_PEN_WIDTH)
+        pen = Pen(_config["INNER_CIRCLE_COLOR"], _config["CIRCLE_PEN_WIDTH"])
         gfx.DrawEllipse(pen, float(icx - ir), float(icy - ir), float(ir * 2), float(ir * 2))
         gfx.DrawLine(pen, float(icx - ir), float(icy), float(icx + ir), float(icy))
         gfx.DrawLine(pen, float(icx), float(icy - ir), float(icx), float(icy + ir))
         pen.Dispose()
-        return  # Nothing else drawn in alignment mode
+        return
 
     # --- Circles (all modes 0-3) ---
-    pen = Pen(OUTER_CIRCLE_COLOR, CIRCLE_PEN_WIDTH)
+    pen = Pen(_config["OUTER_CIRCLE_COLOR"], _config["CIRCLE_PEN_WIDTH"])
     gfx.DrawEllipse(pen, float(ocx - ore), float(ocy - ore), float(ore * 2), float(ore * 2))
     pen.Dispose()
 
-    pen = Pen(INNER_CIRCLE_COLOR, CIRCLE_PEN_WIDTH)
+    pen = Pen(_config["INNER_CIRCLE_COLOR"], _config["CIRCLE_PEN_WIDTH"])
     gfx.DrawEllipse(pen, float(icx - ir), float(icy - ir), float(ir * 2), float(ir * 2))
     pen.Dispose()
 
     # --- Center crosshairs (modes 0-2) ---
-    # Yellow crosshair at outer center, green crosshair at inner center.
-    # These are small fixed-size markers, unlike mode 4's full-diameter ones.
     if mode <= 2:
-        pen = Pen(CROSSHAIR_COLOR, CROSSHAIR_PEN_WIDTH)
-        ch = float(CROSSHAIR_LENGTH)
+        pen = Pen(_config["CROSSHAIR_COLOR"], _config["CROSSHAIR_PEN_WIDTH"])
+        ch = float(_config["CROSSHAIR_LENGTH"])
         gfx.DrawLine(pen, float(ocx - ch), float(ocy), float(ocx + ch), float(ocy))
         gfx.DrawLine(pen, float(ocx), float(ocy - ch), float(ocx), float(ocy + ch))
         pen.Dispose()
 
-        pen = Pen(INNER_CIRCLE_COLOR, CROSSHAIR_PEN_WIDTH)
-        ch2 = float(CROSSHAIR_LENGTH * 0.6)
+        pen = Pen(_config["INNER_CIRCLE_COLOR"], _config["CROSSHAIR_PEN_WIDTH"])
+        ch2 = float(_config["CROSSHAIR_LENGTH"] * 0.6)
         gfx.DrawLine(pen, float(icx - ch2), float(icy), float(icx + ch2), float(icy))
         gfx.DrawLine(pen, float(icx), float(icy - ch2), float(icx), float(icy + ch2))
         pen.Dispose()
 
     # --- Offset vector line between centers (modes 0-2) ---
-    # Dashed cyan line from outer center to inner center with arrowhead.
     dx = icx - ocx
     dy = icy - ocy
     offset_dist = math.sqrt(dx * dx + dy * dy)
 
     if mode <= 2 and offset_dist > 0.5:
-        pen = Pen(OFFSET_LINE_COLOR, OFFSET_PEN_WIDTH)
+        pen = Pen(_config["OFFSET_LINE_COLOR"], _config["OFFSET_PEN_WIDTH"])
         try:
             pen.DashStyle = DashStyle.Dash
         except:
@@ -925,7 +1001,7 @@ def draw_overlay(gfx, width, height):
             angle = math.atan2(dy, dx)
             a1 = angle + math.pi * 0.8
             a2 = angle - math.pi * 0.8
-            pen = Pen(OFFSET_LINE_COLOR, OFFSET_PEN_WIDTH)
+            pen = Pen(_config["OFFSET_LINE_COLOR"], _config["OFFSET_PEN_WIDTH"])
             gfx.DrawLine(pen,
                 float(icx), float(icy),
                 float(icx + arrow_len * math.cos(a1)), float(icy + arrow_len * math.sin(a1)))
@@ -935,15 +1011,12 @@ def draw_overlay(gfx, width, height):
             pen.Dispose()
 
     # --- Correction arrows (all modes 0-3) ---
-    # These arrows point in the direction the inner circle needs to MOVE to
-    # become concentric with the outer circle (opposite of the offset vector).
-    # X arrow is placed above the donut, Y arrow to the right.
-    min_arrow_threshold = 1.5  # Don't show arrows for sub-pixel offsets
-    arrow_gap = 15.0           # Gap between outer circle edge and arrow start
+    min_arrow_threshold = 1.5
+    arrow_gap = 15.0
     arrow_shaft = 30.0
     arrow_head = 10.0
     arrow_pen_w = 2.5
-    corr_x = -dx  # Correction = opposite of offset
+    corr_x = -dx
     corr_y = -dy
 
     # X-axis correction arrow (horizontal, above the donut)
@@ -953,7 +1026,7 @@ def draw_overlay(gfx, width, height):
         ax_start = float(ocx)
         ax_end = float(ocx + ax_sign * arrow_shaft)
 
-        pen = Pen(OFFSET_LINE_COLOR, arrow_pen_w)
+        pen = Pen(_config["OFFSET_LINE_COLOR"], arrow_pen_w)
         gfx.DrawLine(pen, ax_start, ax_y, ax_end, ax_y)
         gfx.DrawLine(pen, ax_end, ax_y,
             float(ax_end - ax_sign * arrow_head * 0.7), float(ax_y - arrow_head * 0.5))
@@ -962,8 +1035,8 @@ def draw_overlay(gfx, width, height):
         pen.Dispose()
 
         if mode <= 2:
-            font = Font(FontFamily.GenericMonospace, ARROW_LABEL_FONT_SIZE, FontStyle.Bold)
-            brush = SolidBrush(OFFSET_LINE_COLOR)
+            font = Font(FontFamily.GenericMonospace, _config["ARROW_LABEL_FONT_SIZE"], FontStyle.Bold)
+            brush = SolidBrush(_config["OFFSET_LINE_COLOR"])
             if corr_x > 0:
                 gfx.DrawString("MOVE X >>>", font, brush, float(ocx + 5), float(ax_y - 16))
             else:
@@ -978,7 +1051,7 @@ def draw_overlay(gfx, width, height):
         ay_start = float(ocy)
         ay_end = float(ocy + ay_sign * arrow_shaft)
 
-        pen = Pen(OFFSET_LINE_COLOR, arrow_pen_w)
+        pen = Pen(_config["OFFSET_LINE_COLOR"], arrow_pen_w)
         gfx.DrawLine(pen, ay_x, ay_start, ay_x, ay_end)
         gfx.DrawLine(pen, ay_x, ay_end,
             float(ay_x - arrow_head * 0.5), float(ay_end - ay_sign * arrow_head * 0.7))
@@ -987,9 +1060,8 @@ def draw_overlay(gfx, width, height):
         pen.Dispose()
 
         if mode <= 2:
-            font = Font(FontFamily.GenericMonospace, ARROW_LABEL_FONT_SIZE, FontStyle.Bold)
-            brush = SolidBrush(OFFSET_LINE_COLOR)
-            # In screen coords +Y is down, but for user display +Y means "up"
+            font = Font(FontFamily.GenericMonospace, _config["ARROW_LABEL_FONT_SIZE"], FontStyle.Bold)
+            brush = SolidBrush(_config["OFFSET_LINE_COLOR"])
             if corr_y < 0:
                 gfx.DrawString("MOVE Y UP", font, brush, float(ay_x + 5), float(ocy - arrow_shaft - 5))
             else:
@@ -1007,9 +1079,8 @@ def draw_overlay(gfx, width, height):
 
 
 def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
-    """Draw the X/Y offset readout bar at the bottom of the frame.
-    Shows correction direction and color-codes severity (green=good, red=bad)."""
-    bar_h = float(BOTTOM_BAR_FONT_SIZE + 16)
+    """Draw the X/Y offset readout bar at the bottom of the frame."""
+    bar_h = float(_config["BOTTOM_BAR_FONT_SIZE"] + 16)
     bar_y = float(height) - bar_h
     offset_pct = (offset_dist / ore * 100.0) if ore > 0 else 0.0
 
@@ -1017,11 +1088,10 @@ def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
     gfx.FillRectangle(bg, RectangleF(0.0, bar_y, float(width), bar_h))
     bg.Dispose()
 
-    font_lg = Font(FontFamily.GenericMonospace, BOTTOM_BAR_FONT_SIZE, FontStyle.Bold)
-    font_sm = Font(FontFamily.GenericMonospace, BOTTOM_BAR_FONT_SIZE - 2.0, FontStyle.Regular)
+    font_lg = Font(FontFamily.GenericMonospace, _config["BOTTOM_BAR_FONT_SIZE"], FontStyle.Bold)
+    font_sm = Font(FontFamily.GenericMonospace, _config["BOTTOM_BAR_FONT_SIZE"] - 2.0, FontStyle.Regular)
 
     def offset_color(val):
-        """Color-code an offset value: green (< 2%) through red (> 20%)."""
         pct = abs(val) / ore * 100.0 if ore > 0 else 0
         if pct < 2:
             return Color.FromArgb(255, 0, 255, 0)
@@ -1034,17 +1104,15 @@ def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
         else:
             return Color.FromArgb(255, 255, 50, 50)
 
-    # X offset with correction direction indicator
     x_color = offset_color(dx)
     x_brush = SolidBrush(x_color)
-    x_corr = "<<<" if dx > 0 else ">>>"  # Correction = opposite of offset
+    x_corr = "<<<" if dx > 0 else ">>>"
     if abs(dx) < 1.5:
         x_corr = "OK"
     x_text = "X: %+.1f px  %s" % (-dx, x_corr)
     gfx.DrawString(x_text, font_lg, x_brush, float(width * 0.1), bar_y + 6.0)
     x_brush.Dispose()
 
-    # Y offset with correction direction (negate so +Y = up for user)
     y_color = offset_color(dy)
     y_brush = SolidBrush(y_color)
     y_corr = "UP" if dy > 0 else "DN"
@@ -1054,7 +1122,6 @@ def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
     gfx.DrawString(y_text, font_lg, y_brush, float(width * 0.45), bar_y + 6.0)
     y_brush.Dispose()
 
-    # Total offset magnitude
     tot_color = offset_color(offset_dist)
     tot_brush = SolidBrush(tot_color)
     tot_text = "Total: %.1f px (%.1f%%)" % (offset_dist, offset_pct)
@@ -1071,16 +1138,14 @@ def draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist
     dy = icy - ocy
     offset_pct = (offset_dist / ore * 100.0) if ore > 0 else 0.0
 
-    # Direction of offset in degrees (0=right, 90=up)
     if offset_dist > 0.5:
-        angle_deg = math.degrees(math.atan2(-dy, dx))  # Negate Y for screen coords
+        angle_deg = math.degrees(math.atan2(-dy, dx))
         if angle_deg < 0:
             angle_deg += 360.0
         dir_str = "%.0f deg" % angle_deg
     else:
         dir_str = "--"
 
-    # Quality rating based on offset as % of outer radius
     if offset_pct < 2:
         quality = "EXCELLENT"
         qcolor = Color.FromArgb(255, 0, 255, 0)
@@ -1101,20 +1166,21 @@ def draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist
         "COLLIMATION OVERLAY",
         "-------------------",
         "Offset: %.1f px (%.1f%%)" % (offset_dist, offset_pct),
-        "dX: %+.1f  dY: %+.1f" % (dx, -dy),  # -dy so +Y = up for user
+        "dX: %+.1f  dY: %+.1f" % (dx, -dy),
         "Direction: %s" % dir_str,
         "Outer R: %.0f  Inner R: %.0f" % (ore, ir),
         "Quality: %s" % quality,
     ]
 
-    font = Font(FontFamily.GenericMonospace, TEXT_FONT_SIZE, FontStyle.Regular)
-    txt_brush = SolidBrush(TEXT_COLOR)
-    bg_brush = SolidBrush(TEXT_BG_COLOR)
+    txt_font_size = _config["TEXT_FONT_SIZE"]
+    font = Font(FontFamily.GenericMonospace, txt_font_size, FontStyle.Regular)
+    txt_brush = SolidBrush(_config["TEXT_COLOR"])
+    bg_brush = SolidBrush(_config["TEXT_BG_COLOR"])
     q_brush = SolidBrush(qcolor)
 
     pad = 6
-    line_h = TEXT_FONT_SIZE + 4
-    panel_w = float(TEXT_FONT_SIZE * 22)
+    line_h = txt_font_size + 4
+    panel_w = float(txt_font_size * 22)
     panel_h = float(len(lines) * line_h + pad * 2)
 
     gfx.FillRectangle(bg_brush, RectangleF(float(pad), float(pad), panel_w, panel_h))
@@ -1122,7 +1188,6 @@ def draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist
     y = float(pad + 4)
     for i, line in enumerate(lines):
         if i == 6:
-            # Quality line: "Quality: " in white, value in color
             gfx.DrawString("Quality: ", font, txt_brush, float(pad + 6), y)
             gfx.DrawString("         %s" % quality, font, q_brush, float(pad + 6), y)
         else:
@@ -1137,11 +1202,12 @@ def draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist
 
 def draw_status_text(gfx, text):
     """Draw a status message (e.g., 'Searching for donut...') at top-left."""
-    font = Font(FontFamily.GenericMonospace, TEXT_FONT_SIZE, FontStyle.Bold)
+    txt_font_size = _config["TEXT_FONT_SIZE"]
+    font = Font(FontFamily.GenericMonospace, txt_font_size, FontStyle.Bold)
     brush = SolidBrush(Color.Orange)
-    bg = SolidBrush(TEXT_BG_COLOR)
-    w = float(len(text) * (TEXT_FONT_SIZE * 0.65) + 16)
-    h = float(TEXT_FONT_SIZE + 10)
+    bg = SolidBrush(_config["TEXT_BG_COLOR"])
+    w = float(len(text) * (txt_font_size * 0.65) + 16)
+    h = float(txt_font_size + 10)
     gfx.FillRectangle(bg, RectangleF(6.0, 6.0, w, h))
     gfx.DrawString(text, font, brush, 10.0, 8.0)
     font.Dispose()
@@ -1153,7 +1219,7 @@ def draw_error_text(gfx, text):
     """Draw an error message at top-left (red text on dark background)."""
     font = Font(FontFamily.GenericMonospace, 10.0, FontStyle.Regular)
     brush = SolidBrush(Color.Red)
-    bg = SolidBrush(TEXT_BG_COLOR)
+    bg = SolidBrush(_config["TEXT_BG_COLOR"])
     gfx.FillRectangle(bg, RectangleF(10.0, 10.0, 500.0, 20.0))
     gfx.DrawString(text, font, brush, 14.0, 12.0)
     font.Dispose()
@@ -1164,19 +1230,9 @@ def draw_error_text(gfx, text):
 # =============================================================================
 # FRAME HANDLER
 # =============================================================================
-# This is the core event handler registered on camera.BeforeFrameDisplay.
-# It runs on every frame SharpCap is about to display. The handler:
-#   1. Gets the drawable bitmap (for drawing overlays)
-#   2. Periodically gets the frame bitmap (for pixel analysis)
-#   3. Runs donut analysis on the frame pixels
-#   4. Draws the overlay using current (smoothed) detection state
-#
-# IMPORTANT: All GDI+ resources (Pen, Brush, Font, Graphics, Bitmap) must
-# be Disposed to avoid memory leaks. The finally block ensures cleanup.
 
 def on_before_frame_display(*args):
     """BeforeFrameDisplay event handler. Called by SharpCap on every frame."""
-    # Skip if disabled or in "Off" display mode
     if not _state["enabled"] or _state["display_mode"] >= len(_DISPLAY_MODE_NAMES) - 1:
         return
 
@@ -1186,9 +1242,6 @@ def on_before_frame_display(*args):
     try:
         frame = args[1].Frame
 
-        # Try the frame annotation API first (avoids bitmap alloc/dispose overhead).
-        # Requires a string key to identify the annotation layer.
-        # Falls back to the older GetDrawableBitmap approach if unavailable.
         try:
             gfx = frame.GetAnnotationGraphics("collimation")
         except:
@@ -1205,26 +1258,20 @@ def on_before_frame_display(*args):
         _state["frame_count"] += 1
 
         # --- Analysis phase (runs every ANALYSIS_INTERVAL frames) ---
-        if _state["frame_count"] % ANALYSIS_INTERVAL == 0:
+        if _state["frame_count"] % _config["ANALYSIS_INTERVAL"] == 0:
             roi_frame = None
             try:
-                # When tracking, use CutROI for smaller analysis region
                 approx_center = None
                 roi_ox = roi_oy = 0
                 peak = None
                 if _state["outer_cx"] is not None and _state["outer_r"] is not None:
                     roi_frame, roi_ox, roi_oy = _try_cut_roi(frame)
                     if roi_frame is not None:
-                        # CutROI active: pixel scan on small region is fast,
-                        # so let it compute the real peak (more accurate than histogram).
-                        # Only pass approx_center to skip the coarse centroid pass.
                         approx_center = (
                             _state["outer_cx"] - roi_ox,
                             _state["outer_cy"] - roi_oy,
                         )
                     else:
-                        # CutROI failed but tracking: use histogram peak to
-                        # skip the expensive full-frame coarse pixel scan.
                         peak = _get_histogram_peak(frame)
                         approx_center = (
                             _state["outer_cx"],
@@ -1237,13 +1284,11 @@ def on_before_frame_display(*args):
                     result = analyze_bitmap(bmp, peak, approx_center)
                     if result is not None:
                         result["_roi_used"] = roi_frame is not None
-                        # Offset ROI coordinates back to full frame
                         if roi_frame is not None:
                             result["inner_cx"] += roi_ox
                             result["inner_cy"] += roi_oy
                             result["outer_cx"] += roi_ox
                             result["outer_cy"] += roi_oy
-                        # Save reference values on initial detection
                         if _state["ref_peak"] is None and result.get("peak"):
                             _state["ref_peak"] = result["peak"]
                         if _state["ref_outer_r"] is None:
@@ -1270,7 +1315,6 @@ def on_before_frame_display(*args):
         draw_overlay(gfx, info.Width, info.Height)
 
     except Exception as ex:
-        # Try to show the error on-screen so user sees it without the console
         if gfx is not None:
             try:
                 draw_error_text(gfx, "Error: %s" % str(ex))
@@ -1280,7 +1324,6 @@ def on_before_frame_display(*args):
             print("[Collimation] Handler error: %s" % str(ex))
 
     finally:
-        # Always dispose GDI+ resources to prevent memory leaks.
         if gfx is not None:
             try:
                 gfx.Dispose()
@@ -1294,19 +1337,11 @@ def on_before_frame_display(*args):
 
 
 def analyze_bitmap(bmp, peak_override=None, approx_center=None):
-    """
-    Extract raw pixel data from a System.Drawing.Bitmap and run donut analysis.
-
-    Uses LockBits to copy pixel data into a .NET byte array, then calls
-    analyze_donut_raw(). Tries multiple pixel formats for compatibility
-    with different camera types (RGB, ARGB, indexed).
-    """
+    """Extract raw pixel data from a System.Drawing.Bitmap and run donut analysis."""
     width = bmp.Width
     height = bmp.Height
     rect = Rectangle(0, 0, width, height)
 
-    # Try to lock as 24bpp RGB first (most compatible and efficient).
-    # Fall back to other formats if the bitmap doesn't support conversion.
     bmpdata = None
     for fmt in [PixelFormat.Format24bppRgb, PixelFormat.Format32bppArgb,
                 PixelFormat.Format32bppRgb, PixelFormat.Format8bppIndexed]:
@@ -1323,14 +1358,12 @@ def analyze_bitmap(bmp, peak_override=None, approx_center=None):
             _state["last_error"] = "LockBits failed: %s" % str(ex)
             return None
 
-    # Copy pixel data from unmanaged memory to a .NET byte array
     stride = bmpdata.Stride
     total = abs(stride) * height
     raw = Array.CreateInstance(Byte, total)
     Marshal.Copy(bmpdata.Scan0, raw, 0, total)
     bmp.UnlockBits(bmpdata)
 
-    # Compute bytes per pixel from stride (stride may include padding bytes)
     bpp = abs(stride) // width
     if bpp < 1:
         bpp = 1
@@ -1348,8 +1381,6 @@ def cycle_display_mode():
     mode = _state["display_mode"]
     name = _DISPLAY_MODE_NAMES[mode]
     print("[Collimation] Display: %s" % name)
-    # When cycling back from Off to All, reset detection state so it
-    # re-acquires the donut from scratch (position may have changed).
     if mode == 0:
         _state["outer_cx"] = None
         _state["outer_cy"] = None
@@ -1364,12 +1395,7 @@ def cycle_display_mode():
 
 
 def diagnose():
-    """
-    Diagnostic tool: captures one frame and tests all pixel access methods.
-    Prints detailed results to the console. Use this to debug detection
-    issues — it shows what pixel data is actually available and what values
-    the camera is producing.
-    """
+    """Diagnostic tool: captures one frame and tests all pixel access methods."""
     print("[Diag] Capturing frame - testing all pixel access methods...")
 
     _diag = {"done": False, "info": []}
@@ -1391,7 +1417,6 @@ def diagnose():
             cx = w // 2
             cy = h // 2
 
-            # Method 1: Direct pixel value access (SharpCap native)
             info.append("")
             info.append("=== Method 1: GetPixelValue ===")
             try:
@@ -1404,7 +1429,6 @@ def diagnose():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # Method 2: Raw byte buffer
             info.append("")
             info.append("=== Method 2: frame.ToBytes() ===")
             try:
@@ -1434,7 +1458,6 @@ def diagnose():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # Method 3: Frame as System.Drawing.Bitmap (THIS IS WHAT WE USE)
             info.append("")
             info.append("=== Method 3: frame.GetFrameBitmap() ===")
             try:
@@ -1449,7 +1472,6 @@ def diagnose():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # Method 4: CreateBitmap (requires args in some versions)
             info.append("")
             info.append("=== Method 4: frame.CreateBitmap() ===")
             try:
@@ -1462,7 +1484,6 @@ def diagnose():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # Method 5: Overlay layer (expected to be blank - included for reference)
             info.append("")
             info.append("=== Method 5: GetDrawableBitmap().GetBitmap() ===")
             try:
@@ -1474,7 +1495,6 @@ def diagnose():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # Method 6: Raw memory buffer
             info.append("")
             info.append("=== Method 6: frame.GetBufferLease() ===")
             try:
@@ -1504,11 +1524,7 @@ def diagnose():
 
 
 def probe_apis():
-    """
-    Probe the new SharpCap APIs and print what's available.
-    Run this in the console and paste the output for debugging.
-    Usage: probe_apis()
-    """
+    """Probe the new SharpCap APIs and print what's available."""
     print("[Probe] Capturing one frame to test APIs...")
 
     _probe = {"done": False, "info": []}
@@ -1521,7 +1537,6 @@ def probe_apis():
         try:
             frame = args[1].Frame
 
-            # --- frame.Index ---
             info.append("=== frame.Index ===")
             try:
                 idx = frame.Index
@@ -1529,10 +1544,8 @@ def probe_apis():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # --- frame.GetAnnotationGraphics() ---
             info.append("")
             info.append("=== frame.GetAnnotationGraphics() ===")
-            # Try with various argument patterns
             for test_args, desc in [
                 ((), "no args"),
                 (("collimation",), "string key"),
@@ -1548,7 +1561,6 @@ def probe_apis():
                 except Exception as ex:
                     info.append("  (%s) FAILED: %s" % (desc, ex))
 
-            # --- frame.CalculateHistogram() ---
             info.append("")
             info.append("=== frame.CalculateHistogram() ===")
             try:
@@ -1556,17 +1568,14 @@ def probe_apis():
                 info.append("  Result: %s (type: %s)" % (hist, type(hist)))
                 info.append("  Members: %s" % [x for x in dir(hist) if not x.startswith("_")])
 
-                # Probe GetCentilePointsF (returns float points for centile values)
                 info.append("")
                 info.append("  --- GetCentilePointsF ---")
                 try:
-                    # Try with a single float (99.9th percentile)
                     val = hist.GetCentilePointsF(99.9)
                     info.append("  GetCentilePointsF(99.9) = %s (type: %s)" % (val, type(val)))
                 except Exception as ex2:
                     info.append("  GetCentilePointsF(99.9) FAILED: %s" % ex2)
                 try:
-                    # Try with a list/array of centile values
                     from System import Array, Double, Single
                     for arr_type in [Double, Single]:
                         try:
@@ -1603,7 +1612,6 @@ def probe_apis():
                 except Exception as ex2:
                     info.append("  Array attempt FAILED: %s" % ex2)
 
-                # Probe GetMeansBelowCentile
                 info.append("")
                 info.append("  --- GetMeansBelowCentile ---")
                 try:
@@ -1612,7 +1620,6 @@ def probe_apis():
                 except Exception as ex2:
                     info.append("  GetMeansBelowCentile(99.9) FAILED: %s" % ex2)
 
-                # Probe Values (histogram bin counts)
                 info.append("")
                 info.append("  --- Values ---")
                 try:
@@ -1631,13 +1638,11 @@ def probe_apis():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
-            # --- frame.CutROI() ---
             info.append("")
             info.append("=== frame.CutROI() ===")
             fi = frame.Info
             rx = fi.Width // 2 - 50
             ry = fi.Height // 2 - 50
-            # Try Rectangle argument
             for desc, roi_args in [
                 ("Rectangle", (Rectangle(rx, ry, 100, 100),)),
                 ("4 ints", (rx, ry, 100, 100)),
@@ -1719,7 +1724,7 @@ def show_state():
 
 
 def debug_on():
-    """Enable per-frame debug logging to console. Use debug_off() to stop."""
+    """Enable per-frame debug logging to console."""
     _state["debug_log"] = True
     _state["debug_frames"] = 0
     print("[Collimation] Debug logging ON - each analysis frame will print details")
@@ -1735,22 +1740,10 @@ def debug_off():
 # =============================================================================
 # TEST MODE - synthetic donut for verifying the pipeline
 # =============================================================================
-# These functions let you test the detection algorithm without a real camera.
-# test_synthetic() generates a fake donut image; test_image() loads a file.
-# Both update _state so the overlay draws on the next live frame.
 
 def test_synthetic(width=800, height=600, outer_r=220, inner_r=90,
                    offset_x=15, offset_y=-10):
-    """
-    Generate a synthetic donut image and run analysis on it.
-    Sets the state so the overlay draws on the next frame.
-
-    Args:
-        width, height: image dimensions (should match your camera)
-        outer_r: outer donut radius in pixels
-        inner_r: inner donut radius in pixels
-        offset_x, offset_y: offset of inner circle from outer (simulates miscollimation)
-    """
+    """Generate a synthetic donut image and run analysis on it."""
     print("[Test] Generating synthetic donut: %dx%d" % (width, height))
     print("[Test] Outer R=%d, Inner R=%d, Offset=(%d, %d)" % (outer_r, inner_r, offset_x, offset_y))
 
@@ -1759,7 +1752,6 @@ def test_synthetic(width=800, height=600, outer_r=220, inner_r=90,
     icx = cx + offset_x
     icy = cy + offset_y
 
-    # Build float array with donut pattern (soft edges + diffraction rings)
     pixels = []
     for y in range(height):
         for x in range(width):
@@ -1772,14 +1764,14 @@ def test_synthetic(width=800, height=600, outer_r=220, inner_r=90,
             dist_inner = math.sqrt(dxi * dxi + dyi * dyi)
 
             if dist_inner < inner_r:
-                val = 5.0  # Dark center (secondary shadow)
+                val = 5.0
             elif dist_outer < outer_r:
                 inner_fade = min(1.0, (dist_inner - inner_r) / 15.0) if dist_inner > inner_r else 0.0
                 outer_fade = min(1.0, (outer_r - dist_outer) / 20.0) if dist_outer < outer_r else 0.0
                 val = 200.0 * inner_fade * outer_fade
                 val += 30.0 * max(0, math.cos(dist_outer * 0.3)) * inner_fade * outer_fade
             else:
-                val = 2.0  # Dark background
+                val = 2.0
 
             pixels.append(max(0.0, val))
 
@@ -1808,12 +1800,7 @@ def test_synthetic(width=800, height=600, outer_r=220, inner_r=90,
 
 
 def test_image(path):
-    """
-    Load an image file and run donut analysis on it.
-    Sets the state so the overlay draws on the next frame.
-
-    Usage: test_image(r"C:\\path\\to\\donut.png")
-    """
+    """Load an image file and run donut analysis on it."""
     print("[Test] Loading image: %s" % path)
     try:
         bmp = Bitmap(path)
@@ -1845,19 +1832,298 @@ def test_image(path):
 
 
 # =============================================================================
+# SETTINGS DIALOG
+# =============================================================================
+# WinForms-based non-modal settings palette. Opens via toolbar button or
+# settings() console command. Changes apply live to the running overlay.
+
+# Metadata for building the settings UI: (key, label, tab, control_type, min, max, step)
+_SETTINGS_META = [
+    # --- Appearance tab ---
+    ("OUTER_CIRCLE_COLOR",    "Outer Circle Color",    "Appearance", "color", None, None, None),
+    ("INNER_CIRCLE_COLOR",    "Inner Circle Color",    "Appearance", "color", None, None, None),
+    ("CROSSHAIR_COLOR",       "Crosshair Color",       "Appearance", "color", None, None, None),
+    ("OFFSET_LINE_COLOR",     "Offset/Arrow Color",    "Appearance", "color", None, None, None),
+    ("TEXT_COLOR",             "Text Color",            "Appearance", "color", None, None, None),
+    ("TEXT_BG_COLOR",          "Text Background Color", "Appearance", "color", None, None, None),
+    ("CIRCLE_PEN_WIDTH",      "Circle Line Width",     "Appearance", "float", 0.5, 10.0, 0.5),
+    ("CROSSHAIR_PEN_WIDTH",   "Crosshair Line Width",  "Appearance", "float", 0.5, 10.0, 0.5),
+    ("OFFSET_PEN_WIDTH",      "Offset Line Width",     "Appearance", "float", 0.5, 10.0, 0.5),
+    ("CROSSHAIR_LENGTH",      "Crosshair Length (px)", "Appearance", "int",   5, 100, 1),
+    ("TEXT_FONT_SIZE",         "Info Panel Font Size",  "Appearance", "int",   6, 24, 1),
+    ("BOTTOM_BAR_FONT_SIZE",  "Bottom Bar Font Size",  "Appearance", "int",   6, 24, 1),
+    ("ARROW_LABEL_FONT_SIZE", "Arrow Label Font Size", "Appearance", "int",   6, 24, 1),
+    # --- Detection tab ---
+    ("NUM_RAYS",                    "Number of Rays",          "Detection", "int",   12, 360, 1),
+    ("BRIGHTNESS_THRESHOLD_PERCENT","Brightness Threshold (%)", "Detection", "int",   1, 80, 1),
+    ("CENTROID_DOWNSAMPLE",         "Centroid Downsample",     "Detection", "int",   1, 16, 1),
+    ("MIN_DONUT_RADIUS",            "Min Donut Radius (px)",   "Detection", "int",   5, 200, 1),
+    ("RAY_STEP",                    "Ray Step (px)",           "Detection", "int",   1, 5, 1),
+    ("ROI_MARGIN_FACTOR",           "ROI Margin Factor",       "Detection", "float", 1.0, 5.0, 0.1),
+    ("SMOOTHING_FACTOR",            "Smoothing Factor",        "Detection", "float", 0.0, 0.95, 0.05),
+    ("MAX_RADIUS_CHANGE_PCT",       "Max Radius Change (%)",   "Detection", "int",   1, 50, 1),
+    ("MAX_CENTER_JUMP_PCT",         "Max Center Jump (%)",     "Detection", "int",   1, 50, 1),
+    ("STALE_FRAME_LIMIT",           "Stale Frame Limit",       "Detection", "int",   3, 100, 1),
+    # --- Performance tab ---
+    ("ANALYSIS_INTERVAL",           "Analysis Interval",       "Performance", "int", 1, 10, 1),
+]
+
+
+def _build_settings_form():
+    """Create and return the settings Form with all controls."""
+    form = Form()
+    form.Text = "Collimation Overlay Settings"
+    form.Width = 500
+    form.Height = 560
+    form.FormBorderStyle = FormBorderStyle.FixedDialog
+    form.MaximizeBox = False
+    form.MinimizeBox = False
+    form.StartPosition = FormStartPosition.CenterScreen
+    try:
+        form.AutoScaleMode = WinFormsAutoScaleMode.Dpi
+    except:
+        pass
+
+    # Tab control
+    tabs = TabControl()
+    tabs.Dock = DockStyle.Fill
+    tabs.Padding = Padding(6, 3, 6, 3)
+
+    # Create tab pages
+    tab_pages = {}
+    for tab_name in ["Appearance", "Detection", "Performance"]:
+        tp = TabPage()
+        tp.Text = tab_name
+        tp.AutoScroll = True
+        tp.Padding = Padding(8)
+        tab_pages[tab_name] = tp
+        tabs.TabPages.Add(tp)
+
+    # Bottom panel with buttons
+    bottom = Panel()
+    bottom.Height = 45
+    bottom.Dock = DockStyle.Bottom
+    bottom.Padding = Padding(8, 8, 8, 8)
+
+    btn_reset = Button()
+    btn_reset.Text = "Reset to Defaults"
+    btn_reset.Width = 130
+    btn_reset.Height = 28
+    btn_reset.Left = 10
+    btn_reset.Top = 8
+
+    btn_save = Button()
+    btn_save.Text = "Save"
+    btn_save.Width = 80
+    btn_save.Height = 28
+    btn_save.Left = form.Width - 110
+    btn_save.Top = 8
+
+    bottom.Controls.Add(btn_reset)
+    bottom.Controls.Add(btn_save)
+
+    form.Controls.Add(tabs)
+    form.Controls.Add(bottom)
+
+    # Track all controls for refresh on reset
+    control_map = {}  # key -> (control, alpha_trackbar_or_None)
+
+    # Tooltip for descriptions
+    tip = ToolTip()
+
+    # Layout: stack controls vertically per tab
+    tab_y = {}  # current y position per tab
+
+    for key, label_text, tab_name, ctrl_type, c_min, c_max, c_step in _SETTINGS_META:
+        tp = tab_pages[tab_name]
+        y = tab_y.get(tab_name, 8)
+
+        lbl = Label()
+        lbl.Text = label_text
+        lbl.Left = 8
+        lbl.Top = y + 3
+        lbl.Width = 180
+        lbl.Height = 20
+        tp.Controls.Add(lbl)
+
+        if ctrl_type == "color":
+            # Color panel (click to pick) + alpha trackbar
+            color_val = _config[key]
+
+            pnl = Panel()
+            pnl.Left = 195
+            pnl.Top = y
+            pnl.Width = 50
+            pnl.Height = 24
+            pnl.BackColor = Color.FromArgb(255, color_val.R, color_val.G, color_val.B)
+            pnl.BorderStyle = 1  # FixedSingle
+            tp.Controls.Add(pnl)
+
+            alpha_lbl = Label()
+            alpha_lbl.Text = "A: %d" % color_val.A
+            alpha_lbl.Left = 250
+            alpha_lbl.Top = y + 3
+            alpha_lbl.Width = 45
+            alpha_lbl.Height = 20
+            tp.Controls.Add(alpha_lbl)
+
+            alpha_tb = TrackBar()
+            alpha_tb.Left = 295
+            alpha_tb.Top = y - 2
+            alpha_tb.Width = 150
+            alpha_tb.Height = 30
+            alpha_tb.Minimum = 0
+            alpha_tb.Maximum = 255
+            alpha_tb.Value = color_val.A
+            alpha_tb.TickFrequency = 32
+            alpha_tb.TickStyle = TickStyle.None
+            tp.Controls.Add(alpha_tb)
+
+            # Wire up color panel click
+            _key = key  # capture for closure
+            _pnl = pnl
+            _alpha_tb = alpha_tb
+            _alpha_lbl = alpha_lbl
+
+            def make_color_click(k, p, atb, albl):
+                def on_click(sender, e):
+                    dlg = ColorDialog()
+                    cur = _config[k]
+                    dlg.Color = Color.FromArgb(255, cur.R, cur.G, cur.B)
+                    dlg.FullOpen = True
+                    if dlg.ShowDialog() == DialogResult.OK:
+                        c = dlg.Color
+                        alpha = atb.Value
+                        _config[k] = Color.FromArgb(alpha, c.R, c.G, c.B)
+                        p.BackColor = Color.FromArgb(255, c.R, c.G, c.B)
+                return on_click
+            pnl.Click += make_color_click(_key, _pnl, _alpha_tb, _alpha_lbl)
+
+            def make_alpha_change(k, p, albl):
+                def on_change(sender, e):
+                    alpha = sender.Value
+                    cur = _config[k]
+                    _config[k] = Color.FromArgb(alpha, cur.R, cur.G, cur.B)
+                    albl.Text = "A: %d" % alpha
+                return on_change
+            alpha_tb.ValueChanged += make_alpha_change(_key, _pnl, _alpha_lbl)
+
+            control_map[key] = (pnl, alpha_tb, alpha_lbl)
+            tab_y[tab_name] = y + 30
+
+        elif ctrl_type == "float":
+            nud = NumericUpDown()
+            nud.Left = 195
+            nud.Top = y
+            nud.Width = 80
+            nud.Height = 24
+            nud.DecimalPlaces = 2
+            nud.Minimum = System.Decimal(c_min)
+            nud.Maximum = System.Decimal(c_max)
+            nud.Increment = System.Decimal(c_step)
+            nud.Value = System.Decimal(float(_config[key]))
+            tp.Controls.Add(nud)
+
+            def make_float_change(k):
+                def on_change(sender, e):
+                    _config[k] = float(sender.Value)
+                return on_change
+            nud.ValueChanged += make_float_change(key)
+
+            control_map[key] = (nud, None, None)
+            tab_y[tab_name] = y + 30
+
+        elif ctrl_type == "int":
+            nud = NumericUpDown()
+            nud.Left = 195
+            nud.Top = y
+            nud.Width = 80
+            nud.Height = 24
+            nud.DecimalPlaces = 0
+            nud.Minimum = System.Decimal(c_min)
+            nud.Maximum = System.Decimal(c_max)
+            nud.Increment = System.Decimal(c_step)
+            nud.Value = System.Decimal(int(_config[key]))
+            tp.Controls.Add(nud)
+
+            def make_int_change(k):
+                def on_change(sender, e):
+                    _config[k] = int(sender.Value)
+                return on_change
+            nud.ValueChanged += make_int_change(key)
+
+            control_map[key] = (nud, None, None)
+            tab_y[tab_name] = y + 30
+
+    # --- Button handlers ---
+    def on_reset(sender, e):
+        reset_config()
+        # Refresh all controls
+        for key, label_text, tab_name, ctrl_type, c_min, c_max, c_step in _SETTINGS_META:
+            entry = control_map.get(key)
+            if entry is None:
+                continue
+            ctrl, extra1, extra2 = entry
+            if ctrl_type == "color":
+                color_val = _config[key]
+                ctrl.BackColor = Color.FromArgb(255, color_val.R, color_val.G, color_val.B)
+                if extra1 is not None:
+                    extra1.Value = color_val.A
+                if extra2 is not None:
+                    extra2.Text = "A: %d" % color_val.A
+            elif ctrl_type == "float":
+                ctrl.Value = System.Decimal(float(_config[key]))
+            elif ctrl_type == "int":
+                ctrl.Value = System.Decimal(int(_config[key]))
+        print("[Collimation] Settings reset to defaults in dialog")
+
+    def on_save(sender, e):
+        save_config()
+
+    btn_reset.Click += on_reset
+    btn_save.Click += on_save
+
+    return form
+
+
+def open_settings():
+    """Open the settings dialog (or bring to front if already open)."""
+    sf = _state.get("settings_form")
+    if sf is not None:
+        try:
+            if not sf.IsDisposed:
+                sf.BringToFront()
+                return
+        except:
+            pass
+
+    form = _build_settings_form()
+
+    def on_closed(sender, e):
+        _state["settings_form"] = None
+
+    form.FormClosed += on_closed
+    _state["settings_form"] = form
+    form.Show()
+
+
+def settings():
+    """Console command: open the settings dialog."""
+    open_settings()
+
+
+# =============================================================================
 # SETUP AND TEARDOWN
 # =============================================================================
 
 def _make_icon(icon_type):
-    """Create a 24x24 toolbar icon bitmap using GDI+ drawing.
-    Uses System.Drawing.Graphics directly (not the SharpCap wrapper)."""
+    """Create a 24x24 toolbar icon bitmap using GDI+ drawing."""
     size = 24
     bmp = Bitmap(size, size)
     g = System.Drawing.Graphics.FromImage(bmp)
     g.Clear(Color.Transparent)
 
     if icon_type == "toggle":
-        # Concentric circles icon: red outer, green inner, yellow center dot
         p = Pen(Color.FromArgb(255, 220, 60, 60), 2.0)
         g.DrawEllipse(p, 2, 2, 19, 19)
         p.Dispose()
@@ -1868,8 +2134,25 @@ def _make_icon(icon_type):
         g.FillRectangle(b, RectangleF(10.0, 10.0, 3.0, 3.0))
         b.Dispose()
 
+    elif icon_type == "settings":
+        # Wrench/gear icon
+        p = Pen(Color.FromArgb(255, 200, 200, 200), 2.0)
+        # Outer gear ring
+        g.DrawEllipse(p, 4, 4, 15, 15)
+        p.Dispose()
+        # Inner dot
+        b = SolidBrush(Color.FromArgb(255, 200, 200, 200))
+        g.FillRectangle(b, RectangleF(9.0, 9.0, 5.0, 5.0))
+        b.Dispose()
+        # Gear teeth (4 lines crossing the circle)
+        p = Pen(Color.FromArgb(255, 200, 200, 200), 2.0)
+        g.DrawLine(p, 11.0, 1.0, 11.0, 5.0)   # top
+        g.DrawLine(p, 11.0, 18.0, 11.0, 22.0)  # bottom
+        g.DrawLine(p, 1.0, 11.0, 5.0, 11.0)    # left
+        g.DrawLine(p, 18.0, 11.0, 22.0, 11.0)  # right
+        p.Dispose()
+
     elif icon_type == "reset":
-        # Circular arrow icon (refresh symbol)
         p = Pen(Color.FromArgb(255, 100, 180, 255), 2.0)
         g.DrawArc(p, 4, 4, 15, 15, 0, 270)
         p.Dispose()
@@ -1880,6 +2163,21 @@ def _make_icon(icon_type):
 
     g.Dispose()
     return bmp
+
+
+def _add_toolbar_button(btn_name, icon, tooltip, callback):
+    """Try to add a toolbar button using the 3 known arg orderings."""
+    for arg_order in [
+        (btn_name, icon, tooltip, callback),
+        (btn_name, callback, icon, tooltip),
+        (btn_name, callback, tooltip, icon),
+    ]:
+        try:
+            SharpCap.AddCustomButton(*arg_order)
+            return True
+        except:
+            pass
+    return False
 
 
 def attach_handler():
@@ -1924,45 +2222,51 @@ def stop():
             pass
     _state["buttons"] = []
     _state["enabled"] = False
+    sf = _state.get("settings_form")
+    if sf is not None:
+        try:
+            sf.Close()
+            sf.Dispose()
+        except:
+            pass
+        _state["settings_form"] = None
     print("[Collimation] Stopped. Run the script again to restart.")
 
 
 def setup():
     """
     Initialize the collimation overlay:
-      1. Add the "Coll Overlay" toolbar button
+      1. Add toolbar buttons (Overlay + Settings)
       2. Attach the BeforeFrameDisplay handler to the camera
       3. Print usage instructions to the console
     """
     print("=" * 50)
-    print("  COLLIMATION OVERLAY v4")
+    print("  COLLIMATION OVERLAY v2.0")
     print("=" * 50)
 
-    # Add a single toolbar button that cycles through display modes.
-    # SharpCap's AddCustomButton takes 4 args but the ordering varies by
-    # version, so we try 3 possible orderings and use whichever works.
+    buttons = []
+
+    # Overlay toggle button
     btn_name = "Coll Overlay"
     icon = _make_icon("toggle")
-    btn_added = False
-
-    for arg_order in [
-        (btn_name, icon, "Cycle collimation overlay mode", cycle_display_mode),
-        (btn_name, cycle_display_mode, icon, "Cycle collimation overlay mode"),
-        (btn_name, cycle_display_mode, "Cycle collimation overlay mode", icon),
-    ]:
-        if not btn_added:
-            try:
-                SharpCap.AddCustomButton(*arg_order)
-                btn_added = True
-            except:
-                pass
-
-    if btn_added:
-        _state["buttons"] = [btn_name]
+    if _add_toolbar_button(btn_name, icon, "Cycle collimation overlay mode", cycle_display_mode):
+        buttons.append(btn_name)
         print("[OK] Toolbar button: '%s'" % btn_name)
     else:
-        print("[WARN] Could not add toolbar button")
+        print("[WARN] Could not add overlay button")
         print("  Use cycle_display_mode() in console")
+
+    # Settings button
+    btn_settings = "Coll Settings"
+    icon_settings = _make_icon("settings")
+    if _add_toolbar_button(btn_settings, icon_settings, "Open collimation settings", open_settings):
+        buttons.append(btn_settings)
+        print("[OK] Toolbar button: '%s'" % btn_settings)
+    else:
+        print("[WARN] Could not add settings button")
+        print("  Use settings() in console")
+
+    _state["buttons"] = buttons
 
     attach_handler()
 
@@ -1973,12 +2277,13 @@ def setup():
         print("  %s %d. %s" % (marker, i + 1, name))
     print("")
     print("Console commands:")
-    print("  cycle_display_mode()   - same as button")
+    print("  cycle_display_mode()   - same as overlay button")
+    print("  settings()             - open settings dialog")
     print("  reset_tracking()       - re-detect donut")
     print("  show_state()           - debug info")
     print("  debug_on() / debug_off() - per-frame logging")
     print("  probe_apis()           - test new SharpCap APIs")
-    print("  stop()                 - fully stop + remove button")
+    print("  stop()                 - fully stop + remove buttons")
     print("=" * 50)
 
 
@@ -1986,7 +2291,7 @@ def setup():
 # AUTO-START
 # =============================================================================
 # When this script is executed (via File > Run Script or exec()), setup()
-# runs automatically, registering the handler and creating the toolbar button.
+# runs automatically, registering the handler and creating the toolbar buttons.
 # The script then exits, but the handler remains active on every frame.
 
 setup()

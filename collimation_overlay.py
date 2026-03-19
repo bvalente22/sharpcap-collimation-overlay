@@ -16,19 +16,32 @@
 #     1. Read pixel data via frame.GetFrameBitmap() + LockBits
 #     2. Analyze the image for a donut pattern (radial ray casting)
 #     3. Fit circles to detected edges (Kasa least-squares method)
-#     4. Draw overlays via frame.GetDrawableBitmap().GetGraphics()
+#     4. Draw overlays via frame.GetAnnotationGraphics() (frame annotations)
+#        with fallback to frame.GetDrawableBitmap().GetGraphics()
+#
+#   Performance optimizations (when APIs are available):
+#     - frame.GetAnnotationGraphics(): avoids bitmap alloc/dispose per frame
+#     - frame.CalculateHistogram(): gets peak brightness natively (skips pixel loop)
+#     - frame.CutROI(): analyzes only the donut region when tracking (smaller buffer)
+#     - frame.Index: native frame counter (avoids manual tracking)
 #
 #   The script itself runs once to set up the handler and toolbar button,
 #   then exits. The handler remains attached and runs per-frame until
 #   stop() is called or SharpCap closes.
 #
-# SHARPCAP API NOTES (4.1):
-#   - GetDrawableBitmap().GetGraphics() returns WinformGraphicsImpl, a
-#     wrapper around System.Drawing.Graphics. Most GDI+ methods work but:
+# SHARPCAP API NOTES (4.1+):
+#   - GetAnnotationGraphics() returns a graphics context for frame annotations
+#     drawn over the frame without bitmap overhead. Same API as GDI+ wrapper.
+#   - GetDrawableBitmap().GetGraphics() is the fallback — returns WinformGraphicsImpl.
+#     Most GDI+ methods work but:
 #       * FillRectangle requires (brush, RectangleF) not (brush, x, y, w, h)
 #       * SmoothingMode/DashStyle may not be supported (wrapped in try/except)
 #   - GetDrawableBitmap().GetBitmap() returns the OVERLAY layer (blank),
 #     NOT the camera frame. Use frame.GetFrameBitmap() for actual pixels.
+#   - CalculateHistogram() returns HistogramData with centile accessors.
+#   - CutROI(x, y, w, h) returns a sub-frame for focused processing.
+#     Must call .Release() on the returned copy.
+#   - frame.Index provides a native frame sequence number.
 #   - AddCustomButton takes 4 args but the arg order varies by version.
 #     We try 3 orderings and use whichever works.
 #
@@ -93,6 +106,8 @@ CENTROID_DOWNSAMPLE = 4             # Sample every Nth pixel when computing cent
                                     # Higher = faster but less precise initial center.
 MIN_DONUT_RADIUS = 15               # Ignore detected circles smaller than this (pixels).
 RAY_STEP = 1                        # Pixel step along each ray. 1 = every pixel.
+ROI_MARGIN_FACTOR = 1.5             # CutROI margin as multiple of outer radius.
+                                    # 1.5 = 50% padding around the donut for tracking.
 
 # Smoothing: exponential moving average applied to circle positions/radii.
 # 0.0 = no smoothing (instant response, may jitter)
@@ -265,7 +280,7 @@ def _get_brightness(pixels, offset, bpp):
         return float(pixels[offset])
 
 
-def analyze_donut_raw(raw, stride, bpp, width, height):
+def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, approx_center=None):
     """
     Analyze raw byte pixel data (from LockBits) for a donut pattern.
 
@@ -274,37 +289,47 @@ def analyze_donut_raw(raw, stride, bpp, width, height):
         stride: row stride in bytes (may differ from width*bpp due to padding)
         bpp: bytes per pixel (1 for mono, 3 for RGB, 4 for ARGB)
         width, height: image dimensions in pixels
+        peak_override: pre-computed peak brightness (from CalculateHistogram)
+        approx_center: (cx, cy) from previous tracking, skips coarse centroid scan
 
     Returns:
         Dict with inner/outer circle parameters, or None if no donut found.
     """
+    # --- Step 1: Determine peak brightness and approximate center ---
     step = CENTROID_DOWNSAMPLE
+    if peak_override is not None and approx_center is not None:
+        # Fast path: tracking mode with histogram data. Skip the expensive
+        # full-frame pixel loop entirely — peak comes from native histogram,
+        # center from previous frame's detection.
+        peak = peak_override
+        threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
+        approx_cx, approx_cy = approx_center
+    else:
+        # Standard path: scan every Nth pixel for peak brightness and
+        # brightness-weighted centroid. Used for initial detection.
+        step = CENTROID_DOWNSAMPLE
+        sum_bx = 0.0
+        sum_by = 0.0
+        sum_b  = 0.0
+        peak   = 0.0
 
-    # --- Step 1: Coarse pass to find peak brightness and approximate center ---
-    # We compute a brightness-weighted centroid over the whole image, sampling
-    # every `step` pixels for speed. This gives us a rough center of the donut.
-    sum_bx = 0.0
-    sum_by = 0.0
-    sum_b  = 0.0
-    peak   = 0.0
+        for y in range(0, height, step):
+            row_off = y * stride
+            for x in range(0, width, step):
+                b = _get_brightness(raw, row_off + x * bpp, bpp)
+                if b > peak:
+                    peak = b
+                if b > 15.0:  # Ignore pixels below noise floor
+                    sum_bx += x * b
+                    sum_by += y * b
+                    sum_b  += b
 
-    for y in range(0, height, step):
-        row_off = y * stride
-        for x in range(0, width, step):
-            b = _get_brightness(raw, row_off + x * bpp, bpp)
-            if b > peak:
-                peak = b
-            if b > 15.0:  # Ignore pixels below noise floor
-                sum_bx += x * b
-                sum_by += y * b
-                sum_b  += b
+        if sum_b < 1.0 or peak < 25.0:
+            return None  # No bright object found
 
-    if sum_b < 1.0 or peak < 25.0:
-        return None  # No bright object found
-
-    approx_cx = sum_bx / sum_b
-    approx_cy = sum_by / sum_b
-    threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
+        approx_cx = sum_bx / sum_b
+        approx_cy = sum_by / sum_b
+        threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
 
     # --- Step 2: Refine center using only bright pixels near the centroid ---
     # The coarse centroid can be pulled off by background gradients. Here we
@@ -549,6 +574,50 @@ def update_state_with_result(result):
     _state["inner_cy"] = smooth_val(_state["inner_cy"], result["inner_cy"], f)
     _state["inner_r"]  = smooth_val(_state["inner_r"],  result["inner_r"],  f)
     _state["status"] = "Tracking"
+
+
+# =============================================================================
+# HISTOGRAM AND ROI HELPERS
+# =============================================================================
+# These use SharpCap APIs revealed by the author to avoid expensive IronPython
+# pixel loops and full-frame buffer copies when possible.
+
+def _get_histogram_peak(frame):
+    """Get approximate peak brightness from frame histogram (native, fast).
+    Uses GetCentilePointsF(99.9) which returns a per-channel array of floats.
+    Returns the max across channels, or None if unavailable."""
+    try:
+        hist = frame.CalculateHistogram()
+        vals = hist.GetCentilePointsF(99.9)
+        # vals is Array[Single] with one entry per channel (e.g., RGBA=4 values).
+        # Take the max across channels as the peak brightness.
+        peak = 0.0
+        for i in range(len(vals)):
+            if vals[i] > peak:
+                peak = float(vals[i])
+        return peak if peak > 0 else None
+    except:
+        return None
+
+
+def _try_cut_roi(frame):
+    """Cut a region of interest around the tracked donut position.
+    Returns (roi_frame, offset_x, offset_y) or (None, 0, 0) on failure.
+    Caller MUST call roi_frame.Release() when done."""
+    try:
+        margin = int(_state["outer_r"] * ROI_MARGIN_FACTOR)
+        info = frame.Info
+        roi_x = max(0, int(_state["outer_cx"]) - margin)
+        roi_y = max(0, int(_state["outer_cy"]) - margin)
+        roi_w = min(info.Width - roi_x, margin * 2)
+        roi_h = min(info.Height - roi_y, margin * 2)
+
+        if roi_w > 50 and roi_h > 50:
+            roi = frame.CutROI(Rectangle(roi_x, roi_y, roi_w, roi_h))
+            return (roi, roi_x, roi_y)
+    except:
+        pass
+    return (None, 0, 0)
 
 
 # =============================================================================
@@ -904,33 +973,57 @@ def on_before_frame_display(*args):
 
     dbitmap = None
     gfx = None
-    bmp = None
 
     try:
         frame = args[1].Frame
 
-        # GetDrawableBitmap returns a wrapper for drawing overlays onto the frame.
-        # GetGraphics() returns a WinformGraphicsImpl (GDI+ wrapper) for drawing.
-        # IMPORTANT: GetBitmap() on this returns the OVERLAY layer, not frame data.
-        dbitmap = frame.GetDrawableBitmap()
-        if dbitmap is None:
-            return
-        gfx = dbitmap.GetGraphics()
+        # Try the frame annotation API first (avoids bitmap alloc/dispose overhead).
+        # Requires a string key to identify the annotation layer.
+        # Falls back to the older GetDrawableBitmap approach if unavailable.
+        try:
+            gfx = frame.GetAnnotationGraphics("collimation")
+        except:
+            dbitmap = frame.GetDrawableBitmap()
+            if dbitmap is None:
+                return
+            gfx = dbitmap.GetGraphics()
+
         if gfx is None:
-            dbitmap.Dispose()
+            if dbitmap is not None:
+                dbitmap.Dispose()
             return
 
         _state["frame_count"] += 1
 
         # --- Analysis phase (runs every ANALYSIS_INTERVAL frames) ---
         if _state["frame_count"] % ANALYSIS_INTERVAL == 0:
+            roi_frame = None
             try:
-                # GetFrameBitmap returns the actual camera frame as a System.Drawing.Bitmap.
-                # We use LockBits to get raw pixel data for analysis.
-                bmp = frame.GetFrameBitmap()
+                # Get peak brightness from histogram (native C#, avoids pixel loop)
+                peak = _get_histogram_peak(frame)
+
+                # When tracking, use CutROI for smaller analysis region
+                approx_center = None
+                roi_ox = roi_oy = 0
+                if _state["outer_cx"] is not None and _state["outer_r"] is not None:
+                    roi_frame, roi_ox, roi_oy = _try_cut_roi(frame)
+                    if roi_frame is not None:
+                        approx_center = (
+                            _state["outer_cx"] - roi_ox,
+                            _state["outer_cy"] - roi_oy,
+                        )
+
+                target = roi_frame if roi_frame is not None else frame
+                bmp = target.GetFrameBitmap()
                 if bmp is not None:
-                    result = analyze_bitmap(bmp)
+                    result = analyze_bitmap(bmp, peak, approx_center)
                     if result is not None:
+                        # Offset ROI coordinates back to full frame
+                        if roi_frame is not None:
+                            result["inner_cx"] += roi_ox
+                            result["inner_cy"] += roi_oy
+                            result["outer_cx"] += roi_ox
+                            result["outer_cy"] += roi_oy
                         update_state_with_result(result)
                         _state["last_error"] = ""
                     elif _state["outer_cx"] is None:
@@ -941,6 +1034,12 @@ def on_before_frame_display(*args):
                 _state["last_error"] = "Analysis: %s" % str(ex)
                 if _state["frame_count"] <= 5:
                     print("[Collimation] Analysis error: %s" % str(ex))
+            finally:
+                if roi_frame is not None:
+                    try:
+                        roi_frame.Release()
+                    except:
+                        pass
 
         # --- Drawing phase (runs every frame for smooth overlay) ---
         info = frame.Info
@@ -953,13 +1052,11 @@ def on_before_frame_display(*args):
                 draw_error_text(gfx, "Error: %s" % str(ex))
             except:
                 pass
-        if _state["frame_count"] < 5:
+        if _state.get("frame_count", 0) < 5:
             print("[Collimation] Handler error: %s" % str(ex))
 
     finally:
         # Always dispose GDI+ resources to prevent memory leaks.
-        # Order matters: dispose Graphics before the DrawableBitmap.
-        # DrawableBitmap.Dispose() copies the drawn overlay back to the frame.
         if gfx is not None:
             try:
                 gfx.Dispose()
@@ -972,7 +1069,7 @@ def on_before_frame_display(*args):
                 pass
 
 
-def analyze_bitmap(bmp):
+def analyze_bitmap(bmp, peak_override=None, approx_center=None):
     """
     Extract raw pixel data from a System.Drawing.Bitmap and run donut analysis.
 
@@ -1014,7 +1111,7 @@ def analyze_bitmap(bmp):
     if bpp < 1:
         bpp = 1
 
-    return analyze_donut_raw(raw, abs(stride), bpp, width, height)
+    return analyze_donut_raw(raw, abs(stride), bpp, width, height, peak_override, approx_center)
 
 
 # =============================================================================
@@ -1177,6 +1274,186 @@ def diagnose():
         print("  %s" % line)
     if not _diag["info"]:
         print("  No frames received!")
+
+
+def probe_apis():
+    """
+    Probe the new SharpCap APIs and print what's available.
+    Run this in the console and paste the output for debugging.
+    Usage: probe_apis()
+    """
+    print("[Probe] Capturing one frame to test APIs...")
+
+    _probe = {"done": False, "info": []}
+
+    def probe_handler(*args):
+        if _probe["done"]:
+            return
+        _probe["done"] = True
+        info = _probe["info"]
+        try:
+            frame = args[1].Frame
+
+            # --- frame.Index ---
+            info.append("=== frame.Index ===")
+            try:
+                idx = frame.Index
+                info.append("  Value: %s (type: %s)" % (idx, type(idx)))
+            except Exception as ex:
+                info.append("  FAILED: %s" % ex)
+
+            # --- frame.GetAnnotationGraphics() ---
+            info.append("")
+            info.append("=== frame.GetAnnotationGraphics() ===")
+            # Try with various argument patterns
+            for test_args, desc in [
+                ((), "no args"),
+                (("collimation",), "string key"),
+                ((0,), "int 0"),
+                ((True,), "bool True"),
+            ]:
+                try:
+                    ag = frame.GetAnnotationGraphics(*test_args)
+                    info.append("  (%s) Result: %s (type: %s)" % (desc, ag, type(ag)))
+                    info.append("  (%s) Members: %s" % (desc, [x for x in dir(ag) if not x.startswith("_")]))
+                    ag.Dispose()
+                    break
+                except Exception as ex:
+                    info.append("  (%s) FAILED: %s" % (desc, ex))
+
+            # --- frame.CalculateHistogram() ---
+            info.append("")
+            info.append("=== frame.CalculateHistogram() ===")
+            try:
+                hist = frame.CalculateHistogram()
+                info.append("  Result: %s (type: %s)" % (hist, type(hist)))
+                info.append("  Members: %s" % [x for x in dir(hist) if not x.startswith("_")])
+
+                # Probe GetCentilePointsF (returns float points for centile values)
+                info.append("")
+                info.append("  --- GetCentilePointsF ---")
+                try:
+                    # Try with a single float (99.9th percentile)
+                    val = hist.GetCentilePointsF(99.9)
+                    info.append("  GetCentilePointsF(99.9) = %s (type: %s)" % (val, type(val)))
+                except Exception as ex2:
+                    info.append("  GetCentilePointsF(99.9) FAILED: %s" % ex2)
+                try:
+                    # Try with a list/array of centile values
+                    from System import Array, Double, Single
+                    for arr_type in [Double, Single]:
+                        try:
+                            arr = Array[arr_type]([50.0, 90.0, 99.0, 99.9])
+                            val = hist.GetCentilePointsF(arr)
+                            info.append("  GetCentilePointsF(Array[%s]([50,90,99,99.9])) = %s" % (arr_type.__name__, val))
+                            if val is not None:
+                                info.append("    Length: %s, Values: %s" % (len(val), list(val)))
+                            break
+                        except Exception as ex3:
+                            info.append("  GetCentilePointsF(Array[%s]) FAILED: %s" % (arr_type.__name__, ex3))
+                except Exception as ex2:
+                    info.append("  Array attempt FAILED: %s" % ex2)
+
+                info.append("")
+                info.append("  --- GetCentilePoints ---")
+                try:
+                    val = hist.GetCentilePoints(99.9)
+                    info.append("  GetCentilePoints(99.9) = %s (type: %s)" % (val, type(val)))
+                except Exception as ex2:
+                    info.append("  GetCentilePoints(99.9) FAILED: %s" % ex2)
+                try:
+                    from System import Array, Double, Single
+                    for arr_type in [Double, Single]:
+                        try:
+                            arr = Array[arr_type]([50.0, 90.0, 99.0, 99.9])
+                            val = hist.GetCentilePoints(arr)
+                            info.append("  GetCentilePoints(Array[%s]([50,90,99,99.9])) = %s" % (arr_type.__name__, val))
+                            if val is not None:
+                                info.append("    Length: %s, Values: %s" % (len(val), list(val)))
+                            break
+                        except Exception as ex3:
+                            info.append("  GetCentilePoints(Array[%s]) FAILED: %s" % (arr_type.__name__, ex3))
+                except Exception as ex2:
+                    info.append("  Array attempt FAILED: %s" % ex2)
+
+                # Probe GetMeansBelowCentile
+                info.append("")
+                info.append("  --- GetMeansBelowCentile ---")
+                try:
+                    val = hist.GetMeansBelowCentile(99.9)
+                    info.append("  GetMeansBelowCentile(99.9) = %s (type: %s)" % (val, type(val)))
+                except Exception as ex2:
+                    info.append("  GetMeansBelowCentile(99.9) FAILED: %s" % ex2)
+
+                # Probe Values (histogram bin counts)
+                info.append("")
+                info.append("  --- Values ---")
+                try:
+                    vals = hist.Values
+                    info.append("  Type: %s" % type(vals))
+                    info.append("  Channels: %d" % len(vals))
+                    for ch in range(len(vals)):
+                        ch_data = vals[ch]
+                        info.append("  Channel %d: %d bins, max=%d, last_nonzero_idx=%s" % (
+                            ch, len(ch_data), max(ch_data),
+                            max([i for i in range(len(ch_data)) if ch_data[i] > 0]) if any(ch_data[i] > 0 for i in range(len(ch_data))) else "none"
+                        ))
+                except Exception as ex2:
+                    info.append("  Values FAILED: %s" % ex2)
+
+            except Exception as ex:
+                info.append("  FAILED: %s" % ex)
+
+            # --- frame.CutROI() ---
+            info.append("")
+            info.append("=== frame.CutROI() ===")
+            fi = frame.Info
+            rx = fi.Width // 2 - 50
+            ry = fi.Height // 2 - 50
+            # Try Rectangle argument
+            for desc, roi_args in [
+                ("Rectangle", (Rectangle(rx, ry, 100, 100),)),
+                ("4 ints", (rx, ry, 100, 100)),
+                ("2 Points", (System.Drawing.Point(rx, ry), System.Drawing.Size(100, 100))),
+            ]:
+                try:
+                    roi = frame.CutROI(*roi_args)
+                    info.append("  (%s) Result: %s (type: %s)" % (desc, roi, type(roi)))
+                    ri = roi.Info
+                    info.append("  (%s) ROI size: %dx%d" % (desc, ri.Width, ri.Height))
+                    try:
+                        rbmp = roi.GetFrameBitmap()
+                        info.append("  (%s) GetFrameBitmap: %dx%d (works!)" % (desc, rbmp.Width, rbmp.Height))
+                    except Exception as ex2:
+                        info.append("  (%s) GetFrameBitmap FAILED: %s" % (desc, ex2))
+                    roi.Release()
+                    info.append("  (%s) Release: OK" % desc)
+                    break
+                except Exception as ex:
+                    info.append("  (%s) FAILED: %s" % (desc, ex))
+
+        except Exception as ex:
+            info.append("TOP-LEVEL EXCEPTION: %s" % str(ex))
+
+    cam = SharpCap.SelectedCamera
+    if cam is None:
+        print("[Probe] ERROR: No camera selected!")
+        return
+
+    cam.BeforeFrameDisplay += probe_handler
+
+    import time
+    time.sleep(2)
+
+    cam.BeforeFrameDisplay -= probe_handler
+
+    print("[Probe] Results:")
+    for line in _probe["info"]:
+        print("  %s" % line)
+    if not _probe["info"]:
+        print("  No frames received!")
+    print("")
+    print("Copy everything above and paste it back for analysis.")
 
 
 def reset_tracking():
@@ -1408,7 +1685,7 @@ def setup():
       3. Print usage instructions to the console
     """
     print("=" * 50)
-    print("  COLLIMATION OVERLAY v3")
+    print("  COLLIMATION OVERLAY v4")
     print("=" * 50)
 
     # Add a single toolbar button that cycles through display modes.
@@ -1449,6 +1726,7 @@ def setup():
     print("  cycle_display_mode()   - same as button")
     print("  reset_tracking()       - re-detect donut")
     print("  show_state()           - debug info")
+    print("  probe_apis()           - test new SharpCap APIs")
     print("  stop()                 - fully stop + remove button")
     print("=" * 50)
 

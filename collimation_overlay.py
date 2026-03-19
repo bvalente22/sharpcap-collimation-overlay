@@ -106,8 +106,15 @@ CENTROID_DOWNSAMPLE = 4             # Sample every Nth pixel when computing cent
                                     # Higher = faster but less precise initial center.
 MIN_DONUT_RADIUS = 15               # Ignore detected circles smaller than this (pixels).
 RAY_STEP = 1                        # Pixel step along each ray. 1 = every pixel.
-ROI_MARGIN_FACTOR = 1.5             # CutROI margin as multiple of outer radius.
-                                    # 1.5 = 50% padding around the donut for tracking.
+ROI_MARGIN_FACTOR = 2.0             # CutROI margin as multiple of outer radius.
+                                    # 2.0 = 100% padding around the donut for tracking.
+
+# Tracking validation: reject new detections that differ too much from
+# the current smoothed state. Prevents drift from bad frames.
+MAX_RADIUS_CHANGE_PCT = 15          # Max % change in outer radius per detection.
+MAX_CENTER_JUMP_PCT = 20            # Max center jump as % of outer radius.
+STALE_FRAME_LIMIT = 15              # After this many consecutive rejected frames,
+                                    # force a full re-detection from scratch.
 
 # Smoothing: exponential moving average applied to circle positions/radii.
 # 0.0 = no smoothing (instant response, may jitter)
@@ -155,6 +162,11 @@ _state = {
     "last_error": "",
     "buttons": [],          # Toolbar button names (for cleanup)
     "display_mode": 0,      # Index into _DISPLAY_MODE_NAMES
+    "ref_peak": None,       # Reference peak brightness from initial detection
+    "ref_outer_r": None,    # Reference outer radius from initial detection (for ROI sizing)
+    "reject_count": 0,      # Consecutive rejected detection count
+    "debug_log": False,     # Toggle with debug_on() / debug_off()
+    "debug_frames": 0,      # Frames logged since debug enabled
 }
 
 # Display modes cycled by the toolbar button. The last mode ("Off") disables
@@ -234,28 +246,33 @@ def fit_circle(points):
 
 def reject_outliers_and_refit(points, cx, cy, radius):
     """
-    Remove edge points that are far from the initial circle fit, then refit.
-    This improves accuracy when some rays hit noise or diffraction rings.
-    Tolerance is proportional to radius (larger circles allow more slack).
+    Iteratively remove edge points far from the fitted circle, then refit.
+    Runs up to 3 passes with progressively tighter tolerance to handle
+    cases where the initial fit is skewed by many outliers (e.g., diffraction
+    rings causing 70-80px spread on a 90px radius circle).
     """
     if len(points) < 10:
         return cx, cy, radius
 
-    # Tolerance: points within 2 * (15% of radius + 3px) of the fitted circle
-    filtered = []
-    tol = radius * 0.15 + 3
-    for px, py in points:
-        dist = math.sqrt((px - cx) ** 2 + (py - cy) ** 2)
-        if abs(dist - radius) < 2.0 * tol:
-            filtered.append((px, py))
+    cur_cx, cur_cy, cur_r = cx, cy, radius
+    # Progressively tighter: 2.0x, 1.5x, 1.2x of base tolerance
+    for tol_mult in [2.0, 1.5, 1.2]:
+        tol = (cur_r * 0.10 + 3) * tol_mult
+        filtered = []
+        for px, py in points:
+            dist = math.sqrt((px - cur_cx) ** 2 + (py - cur_cy) ** 2)
+            if abs(dist - cur_r) < tol:
+                filtered.append((px, py))
 
-    if len(filtered) < 8:
-        return cx, cy, radius  # Too many rejected, keep original
+        if len(filtered) < 8:
+            break  # Too many rejected at this tolerance, stop tightening
 
-    result = fit_circle(filtered)
-    if result is None:
-        return cx, cy, radius
-    return result
+        result = fit_circle(filtered)
+        if result is None:
+            break
+        cur_cx, cur_cy, cur_r = result
+
+    return cur_cx, cur_cy, cur_r
 
 
 # =============================================================================
@@ -301,6 +318,10 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         # Fastest path: both peak and center provided (histogram + tracking).
         # Skip the pixel scan entirely.
         peak = peak_override
+        # Use reference peak as floor to prevent threshold collapse when dimming
+        ref = _state.get("ref_peak")
+        if ref is not None:
+            peak = max(peak, ref * 0.5)
         threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
         approx_cx, approx_cy = approx_center
     elif approx_center is not None:
@@ -316,6 +337,10 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
                     peak = b
         if peak < 25.0:
             return None
+        # Use reference peak as floor to prevent threshold collapse when dimming
+        ref = _state.get("ref_peak")
+        if ref is not None:
+            peak = max(peak, ref * 0.5)
         threshold = peak * BRIGHTNESS_THRESHOLD_PERCENT / 100.0
     else:
         # Standard path: scan every Nth pixel for peak brightness and
@@ -373,11 +398,16 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
     # --- Step 3: Cast rays outward from center to find inner/outer edges ---
     # Each ray walks pixel-by-pixel from the center outward, looking for
     # brightness transitions. The first dark->bright transition is the inner
-    # edge (boundary of the secondary shadow). The next bright->dark transition
-    # is the outer edge (boundary of the primary mirror light cone).
+    # edge (boundary of the secondary shadow).
+    #
+    # For the outer edge, instead of a single-pixel threshold crossing (which
+    # is very noisy on dim images), we find the point of steepest brightness
+    # decline. This is robust to absolute brightness variations because it
+    # detects the edge shape rather than an absolute level.
     inner_points = []
     outer_points = []
     max_ray_len = int(min(width, height) * 0.45)
+    grad_window = 5  # Pixels to average for gradient calculation
 
     for i in range(NUM_RAYS):
         angle = 2.0 * math.pi * i / NUM_RAYS
@@ -386,6 +416,7 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
 
         found_inner = False
         in_bright = False
+        ray_samples = []  # (dist, px, py, brightness) collected after inner edge
 
         for dist in range(3, max_ray_len, RAY_STEP):
             px = int(approx_cx + cos_a * dist)
@@ -403,13 +434,51 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
                     inner_points.append((px, py))
                     found_inner = True
                 in_bright = True
-            elif in_bright and not is_bright:
-                # Transition: bright -> dark = outer edge of the donut ring
-                outer_points.append((px, py))
-                break
+
+            if found_inner:
+                ray_samples.append((dist, px, py, b))
+
+            # Stop collecting well past the expected outer edge
+            if found_inner and not is_bright and len(ray_samples) > grad_window * 2:
+                # Continue a bit past the first dark pixel to capture the full gradient
+                pass
+            if found_inner and not is_bright and len(ray_samples) > grad_window * 3:
+                # We're past the bright region and have enough samples for
+                # gradient calculation. Stop once brightness is very low.
+                if b < 5.0:
+                    break
+
+        # Find outer edge as point of steepest RELATIVE brightness decline.
+        # Using relative gradient (pct drop) instead of absolute ensures that
+        # dim parts of the donut find the edge just as reliably as bright parts.
+        if found_inner and len(ray_samples) > grad_window * 2:
+            best_grad = 0.0
+            best_idx = -1
+            for j in range(grad_window, len(ray_samples) - grad_window):
+                avg_before = 0.0
+                avg_after = 0.0
+                for k in range(grad_window):
+                    avg_before += ray_samples[j - 1 - k][3]
+                    avg_after += ray_samples[j + k][3]
+                avg_before /= grad_window
+                avg_after /= grad_window
+                # Relative gradient: fraction of brightness that drops
+                if avg_before > 1.0:
+                    grad = (avg_before - avg_after) / avg_before
+                else:
+                    grad = 0.0
+                if grad > best_grad:
+                    best_grad = grad
+                    best_idx = j
+            # Accept if at least 30% relative brightness drop
+            if best_idx >= 0 and best_grad > 0.3:
+                _, opx, opy, _ = ray_samples[best_idx]
+                outer_points.append((opx, opy))
 
     # Need enough edge points from enough rays for a reliable circle fit
-    if len(inner_points) < 12 or len(outer_points) < 12:
+    n_inner = len(inner_points)
+    n_outer = len(outer_points)
+    if n_inner < 12 or n_outer < 12:
         return None
 
     # --- Step 4: Fit circles to the inner and outer edge point sets ---
@@ -435,9 +504,22 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
     if center_dist > ore * 0.5:
         return None  # Centers too far apart — probably a bad detection
 
+    # Compute outer edge point spread (diagnostic: how scattered are the points)
+    outer_dists = []
+    for px, py in outer_points:
+        d = math.sqrt((px - ocx) ** 2 + (py - ocy) ** 2)
+        outer_dists.append(d)
+    outer_dists.sort()
+    outer_spread = outer_dists[-1] - outer_dists[0] if outer_dists else 0
+
     return {
         "inner_cx": icx, "inner_cy": icy, "inner_r": ir,
         "outer_cx": ocx, "outer_cy": ocy, "outer_r": ore,
+        "peak": peak,
+        "threshold": threshold,
+        "n_inner": n_inner, "n_outer": n_outer,
+        "outer_spread": outer_spread,
+        "approx_cx": approx_cx, "approx_cy": approx_cy,
     }
 
 
@@ -505,6 +587,7 @@ def analyze_donut_floats(pixels, width, height):
     inner_points = []
     outer_points = []
     max_ray_len = int(min(width, height) * 0.45)
+    grad_window = 5
 
     for i in range(NUM_RAYS):
         angle = 2.0 * math.pi * i / NUM_RAYS
@@ -513,6 +596,7 @@ def analyze_donut_floats(pixels, width, height):
 
         found_inner = False
         in_bright = False
+        ray_samples = []
 
         for dist in range(3, max_ray_len, RAY_STEP):
             px = int(approx_cx + cos_a * dist)
@@ -529,9 +613,36 @@ def analyze_donut_floats(pixels, width, height):
                     inner_points.append((px, py))
                     found_inner = True
                 in_bright = True
-            elif in_bright and not is_bright:
-                outer_points.append((px, py))
-                break
+
+            if found_inner:
+                ray_samples.append((dist, px, py, b))
+
+            if found_inner and not is_bright and len(ray_samples) > grad_window * 3:
+                if b < 5.0:
+                    break
+
+        # Find outer edge as point of steepest relative brightness decline
+        if found_inner and len(ray_samples) > grad_window * 2:
+            best_grad = 0.0
+            best_idx = -1
+            for j in range(grad_window, len(ray_samples) - grad_window):
+                avg_before = 0.0
+                avg_after = 0.0
+                for k in range(grad_window):
+                    avg_before += ray_samples[j - 1 - k][3]
+                    avg_after += ray_samples[j + k][3]
+                avg_before /= grad_window
+                avg_after /= grad_window
+                if avg_before > 1.0:
+                    grad = (avg_before - avg_after) / avg_before
+                else:
+                    grad = 0.0
+                if grad > best_grad:
+                    best_grad = grad
+                    best_idx = j
+            if best_idx >= 0 and best_grad > 0.3:
+                _, opx, opy, _ = ray_samples[best_idx]
+                outer_points.append((opx, opy))
 
     if len(inner_points) < 12 or len(outer_points) < 12:
         return None
@@ -560,6 +671,7 @@ def analyze_donut_floats(pixels, width, height):
     return {
         "inner_cx": icx, "inner_cy": icy, "inner_r": ir,
         "outer_cx": ocx, "outer_cy": ocy, "outer_r": ore,
+        "peak": peak,
     }
 
 
@@ -576,9 +688,88 @@ def smooth_val(old, new, factor):
     return old * factor + new * (1.0 - factor)
 
 
+def _validate_detection(result):
+    """Check if a new detection is consistent with the current smoothed state.
+    Returns True if the result should be accepted, False if it should be rejected.
+    Always accepts when there is no previous state (initial detection)."""
+    old_r = _state["outer_r"]
+    if old_r is None:
+        return True  # No previous state, accept anything
+
+    # Check outer radius didn't change too much
+    new_r = result["outer_r"]
+    radius_change_pct = abs(new_r - old_r) / old_r * 100.0
+    if radius_change_pct > MAX_RADIUS_CHANGE_PCT:
+        return False
+
+    # Check outer center didn't jump too far
+    dx = result["outer_cx"] - _state["outer_cx"]
+    dy = result["outer_cy"] - _state["outer_cy"]
+    center_jump = math.sqrt(dx * dx + dy * dy)
+    if center_jump > old_r * MAX_CENTER_JUMP_PCT / 100.0:
+        return False
+
+    return True
+
+
 def update_state_with_result(result):
-    """Apply smoothing to new analysis results and store in global state."""
+    """Validate and apply smoothing to new analysis results.
+    Rejects detections that differ too much from the current state.
+    After too many consecutive rejections, forces a full re-detection."""
+    is_debug = _state.get("debug_log", False)
+
+    if not _validate_detection(result):
+        _state["reject_count"] = _state.get("reject_count", 0) + 1
+        if is_debug:
+            print("[DBG] REJECTED frame %d (count=%d) raw_or=%.1f spread=%.1f raw_ocx=%.1f raw_ocy=%.1f | smooth_or=%.1f smooth_ocx=%.1f" % (
+                _state["frame_count"], _state["reject_count"],
+                result["outer_r"], result.get("outer_spread", 0),
+                result["outer_cx"], result["outer_cy"],
+                _state["outer_r"] or 0, _state["outer_cx"] or 0))
+        if _state["reject_count"] >= STALE_FRAME_LIMIT:
+            _state["outer_cx"] = None
+            _state["outer_cy"] = None
+            _state["outer_r"] = None
+            _state["inner_cx"] = None
+            _state["inner_cy"] = None
+            _state["inner_r"] = None
+            _state["ref_peak"] = None
+            _state["ref_outer_r"] = None
+            _state["reject_count"] = 0
+            _state["status"] = "Re-detecting..."
+            if is_debug:
+                print("[DBG] RESET - too many rejections, re-detecting from scratch")
+        return
+
+    _state["reject_count"] = 0
     f = SMOOTHING_FACTOR
+
+    if is_debug:
+        old_or = _state["outer_r"]
+        old_ir = _state["inner_r"]
+        roi_used = result.get("_roi_used", False)
+        print("[DBG] f=%d peak=%.0f thr=%.0f rays_i=%d rays_o=%d spread=%.1f %s" % (
+            _state["frame_count"],
+            result.get("peak", 0) or 0,
+            result.get("threshold", 0) or 0,
+            result.get("n_inner", 0),
+            result.get("n_outer", 0),
+            result.get("outer_spread", 0),
+            "ROI" if roi_used else "FULL"))
+        print("[DBG]   raw:  ocx=%.1f ocy=%.1f or=%.1f | icx=%.1f icy=%.1f ir=%.1f" % (
+            result["outer_cx"], result["outer_cy"], result["outer_r"],
+            result["inner_cx"], result["inner_cy"], result["inner_r"]))
+        new_ocx = smooth_val(_state["outer_cx"], result["outer_cx"], f)
+        new_ocy = smooth_val(_state["outer_cy"], result["outer_cy"], f)
+        new_or = smooth_val(old_or, result["outer_r"], f)
+        new_ir = smooth_val(old_ir, result["inner_r"], f)
+        print("[DBG]   smooth: ocx=%.1f ocy=%.1f or=%.1f->%.1f | ir=%.1f->%.1f  ratio=%.2f" % (
+            new_ocx, new_ocy,
+            old_or or 0, new_or,
+            old_ir or 0, new_ir,
+            new_ir / new_or if new_or > 0 else 0))
+        _state["debug_frames"] = _state.get("debug_frames", 0) + 1
+
     _state["outer_cx"] = smooth_val(_state["outer_cx"], result["outer_cx"], f)
     _state["outer_cy"] = smooth_val(_state["outer_cy"], result["outer_cy"], f)
     _state["outer_r"]  = smooth_val(_state["outer_r"],  result["outer_r"],  f)
@@ -620,7 +811,10 @@ def _try_cut_roi(frame):
     Returns (roi_frame, offset_x, offset_y) or (None, 0, 0) on failure.
     Caller MUST call roi_frame.Release() when done."""
     try:
-        margin = int(_state["outer_r"] * ROI_MARGIN_FACTOR)
+        # Use reference radius (from initial detection) for ROI sizing to prevent
+        # feedback loop where shrinking radius -> smaller ROI -> fewer rays -> smaller radius
+        roi_r = _state.get("ref_outer_r") or _state["outer_r"]
+        margin = int(roi_r * ROI_MARGIN_FACTOR)
         info = frame.Info
         roi_x = max(0, int(_state["outer_cx"]) - margin)
         roi_y = max(0, int(_state["outer_cy"]) - margin)
@@ -1042,12 +1236,18 @@ def on_before_frame_display(*args):
                 if bmp is not None:
                     result = analyze_bitmap(bmp, peak, approx_center)
                     if result is not None:
+                        result["_roi_used"] = roi_frame is not None
                         # Offset ROI coordinates back to full frame
                         if roi_frame is not None:
                             result["inner_cx"] += roi_ox
                             result["inner_cy"] += roi_oy
                             result["outer_cx"] += roi_ox
                             result["outer_cy"] += roi_oy
+                        # Save reference values on initial detection
+                        if _state["ref_peak"] is None and result.get("peak"):
+                            _state["ref_peak"] = result["peak"]
+                        if _state["ref_outer_r"] is None:
+                            _state["ref_outer_r"] = result["outer_r"]
                         update_state_with_result(result)
                         _state["last_error"] = ""
                     elif _state["outer_cx"] is None:
@@ -1157,6 +1357,9 @@ def cycle_display_mode():
         _state["inner_cx"] = None
         _state["inner_cy"] = None
         _state["inner_r"] = None
+        _state["ref_peak"] = None
+        _state["ref_outer_r"] = None
+        _state["reject_count"] = 0
         _state["status"] = "Searching for donut..."
 
 
@@ -1488,6 +1691,9 @@ def reset_tracking():
     _state["inner_cx"] = None
     _state["inner_cy"] = None
     _state["inner_r"] = None
+    _state["ref_peak"] = None
+    _state["ref_outer_r"] = None
+    _state["reject_count"] = 0
     _state["status"] = "Searching for donut..."
     print("[Collimation] Tracking reset")
 
@@ -1503,7 +1709,27 @@ def show_state():
         _state["outer_cx"] or 0, _state["outer_cy"] or 0, _state["outer_r"] or 0))
     print("  inner: cx=%.1f cy=%.1f r=%.1f" % (
         _state["inner_cx"] or 0, _state["inner_cy"] or 0, _state["inner_r"] or 0))
+    print("  ref_peak: %s" % _state.get("ref_peak"))
+    print("  ref_outer_r: %s" % _state.get("ref_outer_r"))
+    print("  reject_count: %d" % _state.get("reject_count", 0))
+    print("  debug_log: %s" % _state.get("debug_log", False))
+    if _state["outer_r"] and _state["inner_r"]:
+        print("  inner/outer ratio: %.2f" % (_state["inner_r"] / _state["outer_r"]))
     print("  last_error: %s" % _state["last_error"])
+
+
+def debug_on():
+    """Enable per-frame debug logging to console. Use debug_off() to stop."""
+    _state["debug_log"] = True
+    _state["debug_frames"] = 0
+    print("[Collimation] Debug logging ON - each analysis frame will print details")
+    print("[Collimation] Use debug_off() to stop")
+
+
+def debug_off():
+    """Disable per-frame debug logging."""
+    _state["debug_log"] = False
+    print("[Collimation] Debug logging OFF (logged %d frames)" % _state.get("debug_frames", 0))
 
 
 # =============================================================================
@@ -1750,6 +1976,7 @@ def setup():
     print("  cycle_display_mode()   - same as button")
     print("  reset_tracking()       - re-detect donut")
     print("  show_state()           - debug info")
+    print("  debug_on() / debug_off() - per-frame logging")
     print("  probe_apis()           - test new SharpCap APIs")
     print("  stop()                 - fully stop + remove button")
     print("=" * 50)

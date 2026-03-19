@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 _sharpcap_collimation_tmp.*
 sharpcap_api_suggestions.md
+collimation_overlay_demo.mp4

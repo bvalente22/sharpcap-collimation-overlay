@@ -29,8 +29,6 @@ Click the **Coll Overlay** toolbar button to cycle through these modes:
 | 5 | **Alignment crosshairs** | Both circles with full-diameter crosshairs in matching colors (red for outer, green for inner) for visual alignment |
 | 6 | **Off** | No overlay drawn. Cycles back to mode 1 on next click. |
 
-You can also type `cycle_display_mode()` in the scripting console.
-
 ## Reading the Overlay
 
 | Element | Meaning |
@@ -55,6 +53,81 @@ You can also type `cycle_display_mode()` in the scripting console.
 | BAD | > 20% | Major collimation needed |
 
 Offset percentage is relative to the outer circle radius.
+
+## Tips for Best Results
+
+### Star Selection and Brightness
+
+- Choose a **bright, isolated star** — the script locks onto the brightest object in the frame, so avoid crowded fields or double stars.
+- **Ideal brightness:** Use SharpCap's histogram to check. The peak should land somewhere in the **middle third of the histogram** (roughly 80-180 on a 0-255 scale). This gives the detector plenty of contrast to work with.
+- If the histogram peak is bunched up at the far right, the star is saturated — reduce exposure or gain. If it barely rises above the left side, increase exposure or gain.
+- Brighter stars (mag 1-3) are easier to work with since they produce a strong, well-defined donut at shorter exposures.
+
+### Defocus Amount
+
+- Defocus the star until the donut is clearly visible with a **dark center and a bright ring**. You should be able to see the secondary mirror shadow distinctly.
+- **Ideal donut size:** Aim for roughly **100-300 pixels in diameter**. The overlay info panel shows the detected outer radius — multiply by 2 for diameter.
+- Too small (under ~30px diameter) and the script can't resolve the inner/outer edges. Too large and you lose brightness and contrast.
+- A good starting point: defocus until the donut is about **1/4 to 1/3 the width of your frame**.
+
+### Using SharpCap Features to Improve Detection
+
+- **Frame stacking / live stacking:** If your donut appears noisy (especially at lower gain or with a dim star), enabling SharpCap's frame stacking can smooth out the noise and give the detector cleaner edges.
+- **Planet/disk stabilization:** If seeing conditions cause the donut to bounce around the frame, SharpCap's stabilization feature can help keep it steady, which improves tracking accuracy and reduces jitter in the overlay.
+- **ROI (Region of Interest):** Setting a smaller ROI around the star in SharpCap speeds up both capture and analysis, letting the script process frames faster.
+
+## Troubleshooting
+
+### "Searching for donut..." never goes away
+
+- **No star visible**: Ensure a bright star is in the field of view and the camera is capturing.
+- **Star not defocused enough**: The star needs to show a clear donut shape with a visible dark center. A focused or slightly defocused star that appears as a bright dot will not be detected.
+- **Star too dim**: Increase exposure or gain. The peak brightness must be above 25 (on a 0-255 scale) for detection to trigger. Check the histogram — the peak should be clearly separated from the background noise.
+- **Star too small**: The donut must be at least ~30px in diameter. If it's smaller, defocus more or increase focal length/magnification.
+- **Donut fills the entire frame**: The script needs some dark background around the donut. If the bright ring extends to the frame edges, the edge detection can't find the outer boundary.
+
+### Star is too dim or too bright
+
+- **Too dim:** The donut appears faint and noisy, or detection keeps dropping out. Increase exposure time or gain. You can also try enabling frame stacking in SharpCap to boost signal.
+- **Too bright / saturated:** The histogram peak is pinned to the right edge. The script can't distinguish the donut edges when everything is clipped at max brightness. Reduce exposure or gain until the histogram peak moves away from the right edge.
+
+### Detection is jittery or unstable
+
+- Poor seeing or low signal-to-noise is the most common cause. Try increasing exposure or enabling stabilization.
+- If the donut is noisy, frame stacking can help smooth things out.
+- You can also increase `SMOOTHING_FACTOR` in the script configuration (see [Configuration](#configuration)) to 0.7-0.85 for more stable tracking.
+
+### Star moves too far or overlay is lost
+
+- If the star drifts out of the detection area or the overlay disappears, **restart the script** by running it again from the scripting console. Re-running automatically cleans up the previous instance and starts fresh detection.
+- Consider enabling SharpCap's stabilization to keep the star centered, or use a tracking mount.
+
+### Detection locks onto the wrong feature
+
+- If there are multiple bright objects in the frame, the script will find the brightest one. Center your target star and reduce the field of view or increase zoom if needed.
+- Run `reset_tracking()` in the scripting console after repositioning.
+
+### Circles appear but don't match the donut edges well
+
+- **Diffraction rings confusing edges**: If the star shows prominent diffraction rings, the threshold may trip on a ring instead of the true edge. Adjust `BRIGHTNESS_THRESHOLD_PERCENT` up or down in the configuration.
+- **Donut is not circular**: If the donut is significantly elongated (astigmatism, tilt), the circle fit will be an approximation. The script assumes circular symmetry.
+
+### Overlay is slow or laggy
+
+- Set a smaller ROI in SharpCap to reduce the area the script needs to analyze.
+- Increase `ANALYSIS_INTERVAL` to 3-5 in the script configuration (analyze fewer frames).
+- See [Configuration](#configuration) for more performance tuning options.
+
+### Script errors on startup
+
+- Ensure you have SharpCap Pro (scripting is a Pro feature).
+- Ensure a camera is connected and live preview is running before executing the script.
+- Check the scripting console for error messages; `show_state()` and `diagnose()` can help identify the issue.
+
+### Toolbar button doesn't appear
+
+- The button API varies across SharpCap versions. If the button fails to create, the console will show a warning. Use `cycle_display_mode()` in the console as an alternative.
+- Re-running the script automatically removes old buttons before adding new ones.
 
 ## Console Commands
 
@@ -99,51 +172,6 @@ Edit the `USER CONFIGURATION` section at the top of `collimation_overlay.py`:
 **Performance**:
 - `ANALYSIS_INTERVAL` — run detection every Nth frame (default 2)
 - `SMOOTHING_FACTOR` — exponential smoothing, 0.0 = none, 0.9 = very smooth (default 0.6)
-
-## Troubleshooting
-
-### "Searching for donut..." never goes away
-
-- **No star visible**: Ensure a bright star is in the field of view and the camera is capturing.
-- **Star not defocused enough**: The star needs to show a clear donut shape with a visible dark center. A focused or slightly defocused star that appears as a bright dot will not be detected.
-- **Star too dim**: Increase exposure or gain. The peak brightness must be above 25 (on a 0-255 scale) for detection to trigger.
-- **Star too small**: The donut must be at least ~30px in diameter. If it's smaller, defocus more or increase focal length/magnification.
-- **Donut fills the entire frame**: The script needs some dark background around the donut. If the bright ring extends to the frame edges, the ray casting can't find the outer boundary.
-- **Threshold too high/low**: If the donut has very low contrast (faint ring against a noisy background), try lowering `BRIGHTNESS_THRESHOLD_PERCENT` to 15-20. If there's a lot of background glow, try raising it to 40-50.
-
-### Detection is jittery or unstable
-
-- Increase `SMOOTHING_FACTOR` to 0.7-0.85 for more stable tracking.
-- Increase `NUM_RAYS` from 90 to 120+ for more edge points (at slight performance cost).
-- Ensure the image has good signal-to-noise ratio; increase exposure if the donut is noisy.
-
-### Detection locks onto the wrong feature
-
-- If there are multiple bright objects in the frame, the script will find the brightest one. Center your target star and reduce the field of view or increase zoom if needed.
-- Run `reset_tracking()` after repositioning.
-
-### Circles appear but don't match the donut edges well
-
-- **Diffraction rings confusing edges**: If the star shows prominent diffraction rings, the threshold may trip on a ring instead of the true edge. Adjust `BRIGHTNESS_THRESHOLD_PERCENT` up or down.
-- **Donut is not circular**: If the donut is significantly elongated (astigmatism, tilt), the circle fit will be an approximation. The script assumes circular symmetry.
-
-### Overlay is slow or laggy
-
-- Increase `ANALYSIS_INTERVAL` to 3-5 (analyze fewer frames).
-- Increase `CENTROID_DOWNSAMPLE` to 6-8.
-- Reduce `NUM_RAYS` to 60.
-- The drawing phase runs every frame regardless and is fast; the analysis phase is where computation happens.
-
-### Script errors on startup
-
-- Ensure you have SharpCap Pro (scripting is a Pro feature).
-- Ensure a camera is connected and live preview is running before executing the script.
-- Check the scripting console for error messages; `show_state()` and `diagnose()` can help identify the issue.
-
-### Toolbar button doesn't appear
-
-- The button API varies across SharpCap versions. If the button fails to create, the console will show a warning. Use `cycle_display_mode()` in the console as an alternative.
-- Re-running the script automatically removes old buttons before adding new ones.
 
 ## How It Works
 

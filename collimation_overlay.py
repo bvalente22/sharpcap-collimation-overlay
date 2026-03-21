@@ -83,6 +83,8 @@ from System.Windows.Forms import (
     MessageBoxIcon, DialogResult, AutoScaleMode as WinFormsAutoScaleMode,
 )
 
+VERSION = "2.0.2"
+
 # =============================================================================
 # CONFIGURATION SYSTEM
 # =============================================================================
@@ -131,6 +133,9 @@ _DEFAULTS = {
     "SMOOTHING_FACTOR": 0.6,             # EMA factor (0.0 = none, 0.9 = heavy)
     # Performance
     "ANALYSIS_INTERVAL": 2,              # Analyze every Nth frame
+    # Outer edge detection algorithm
+    "DETECTION_ALGORITHM": "edge_to_dark",  # "edge_to_dark", "steepest_gradient", "threshold_crossing"
+    "GRAD_WINDOW": 10,                   # Pixels to average for gradient calculation
 }
 
 # Color keys are identified by suffix for serialization
@@ -142,6 +147,9 @@ _FLOAT_KEYS = frozenset(["CIRCLE_PEN_WIDTH", "CROSSHAIR_PEN_WIDTH", "OFFSET_PEN_
 
 # Bool keys (on/off toggles)
 _BOOL_KEYS = frozenset(k for k in _DEFAULTS if isinstance(_DEFAULTS[k], bool))
+
+# String keys (enum-like text values)
+_STRING_KEYS = frozenset(["DETECTION_ALGORITHM"])
 
 # Live config dict — read by the frame handler on every frame
 _config = {}
@@ -189,6 +197,8 @@ def save_config():
                 lines.append("%s = %d,%d,%d,%d" % (key, t[0], t[1], t[2], t[3]))
             elif key in _BOOL_KEYS:
                 lines.append("%s = %s" % (key, "true" if val else "false"))
+            elif key in _STRING_KEYS:
+                lines.append("%s = %s" % (key, val))
             elif key in _FLOAT_KEYS:
                 lines.append("%s = %.2f" % (key, val))
             else:
@@ -225,6 +235,8 @@ def load_config():
                             _config[key] = Color.FromArgb(parts[0], parts[1], parts[2], parts[3])
                     elif key in _BOOL_KEYS:
                         _config[key] = val.lower() in ("true", "1", "yes")
+                    elif key in _STRING_KEYS:
+                        _config[key] = val
                     elif key in _FLOAT_KEYS:
                         _config[key] = float(val)
                     else:
@@ -302,6 +314,7 @@ _state = {
     "debug_log": False,     # Toggle with debug_on() / debug_off()
     "debug_frames": 0,      # Frames logged since debug enabled
     "settings_form": None,  # Reference to open SettingsForm
+    "restart_blanking": 0,  # Frames remaining to show blank overlay after restart
 }
 
 
@@ -520,9 +533,10 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
     inner_points = []
     outer_points = []
     max_ray_len = int(min(width, height) * 0.45)
-    grad_window = 5  # Pixels to average for gradient calculation
+    grad_window = _config["GRAD_WINDOW"]
     num_rays = _config["NUM_RAYS"]
     ray_step = _config["RAY_STEP"]
+    algorithm = _config["DETECTION_ALGORITHM"]
 
     for i in range(num_rays):
         angle = 2.0 * math.pi * i / num_rays
@@ -560,29 +574,72 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
                 if b < 5.0:
                     break
 
-        # Find outer edge as point of steepest RELATIVE brightness decline.
-        if found_inner and len(ray_samples) > grad_window * 2:
-            best_grad = 0.0
-            best_idx = -1
-            for j in range(grad_window, len(ray_samples) - grad_window):
-                avg_before = 0.0
-                avg_after = 0.0
-                for k in range(grad_window):
-                    avg_before += ray_samples[j - 1 - k][3]
-                    avg_after += ray_samples[j + k][3]
-                avg_before /= grad_window
-                avg_after /= grad_window
-                if avg_before > 1.0:
-                    grad = (avg_before - avg_after) / avg_before
-                else:
-                    grad = 0.0
-                if grad > best_grad:
-                    best_grad = grad
-                    best_idx = j
-            # Accept if at least 30% relative brightness drop
-            if best_idx >= 0 and best_grad > 0.3:
-                _, opx, opy, _ = ray_samples[best_idx]
-                outer_points.append((opx, opy))
+        # --- Outer edge detection (algorithm-dependent) ---
+        if algorithm == "threshold_crossing":
+            # Simple: last point where brightness drops below threshold.
+            # Fast and reliable for high-contrast donuts with clean edges.
+            if found_inner and len(ray_samples) > 5:
+                last_crossing_idx = -1
+                was_above = False
+                for j in range(len(ray_samples)):
+                    if ray_samples[j][3] > threshold:
+                        was_above = True
+                    elif was_above:
+                        last_crossing_idx = j
+                        was_above = False
+                if last_crossing_idx >= 0:
+                    _, opx, opy, _ = ray_samples[last_crossing_idx]
+                    outer_points.append((opx, opy))
+
+        elif algorithm == "steepest_gradient":
+            # Original: steepest relative gradient drop along the ray.
+            # Good for clean donuts and dim stars without diffraction rings.
+            if found_inner and len(ray_samples) > grad_window * 2:
+                best_grad = 0.0
+                best_idx = -1
+                for j in range(grad_window, len(ray_samples) - grad_window):
+                    avg_before = 0.0
+                    avg_after = 0.0
+                    for k in range(grad_window):
+                        avg_before += ray_samples[j - 1 - k][3]
+                        avg_after += ray_samples[j + k][3]
+                    avg_before /= grad_window
+                    avg_after /= grad_window
+                    if avg_before > 1.0:
+                        grad = (avg_before - avg_after) / avg_before
+                    else:
+                        grad = 0.0
+                    if grad > best_grad:
+                        best_grad = grad
+                        best_idx = j
+                if best_idx >= 0 and best_grad > 0.3:
+                    _, opx, opy, _ = ray_samples[best_idx]
+                    outer_points.append((opx, opy))
+
+        else:  # "edge_to_dark" (default)
+            # Steepest gradient that transitions to darkness (below threshold).
+            # Ignores dips between bright diffraction rings. Best for ring-heavy images.
+            if found_inner and len(ray_samples) > grad_window * 2:
+                best_grad = 0.0
+                best_idx = -1
+                for j in range(grad_window, len(ray_samples) - grad_window):
+                    avg_before = 0.0
+                    avg_after = 0.0
+                    for k in range(grad_window):
+                        avg_before += ray_samples[j - 1 - k][3]
+                        avg_after += ray_samples[j + k][3]
+                    avg_before /= grad_window
+                    avg_after /= grad_window
+                    if avg_before > 1.0:
+                        grad = (avg_before - avg_after) / avg_before
+                    else:
+                        grad = 0.0
+                    if grad > best_grad and avg_after < threshold:
+                        best_grad = grad
+                        best_idx = j
+                if best_idx >= 0 and best_grad > 0.3:
+                    _, opx, opy, _ = ray_samples[best_idx]
+                    outer_points.append((opx, opy))
 
     # Need enough edge points from enough rays for a reliable circle fit
     n_inner = len(inner_points)
@@ -1256,6 +1313,14 @@ def on_before_frame_display(*args):
 
         _state["frame_count"] += 1
 
+        # --- Restart blanking: show "Restarting..." with no overlay ---
+        if _state.get("restart_blanking", 0) > 0:
+            _state["restart_blanking"] -= 1
+            draw_status_text(gfx, "Restarting...")
+            if _state["restart_blanking"] == 0:
+                _state["status"] = "Searching for donut..."
+            return
+
         # --- Analysis phase (runs every ANALYSIS_INTERVAL frames) ---
         if _state["frame_count"] % _config["ANALYSIS_INTERVAL"] == 0:
             roi_frame = None
@@ -1374,6 +1439,248 @@ def analyze_bitmap(bmp, peak_override=None, approx_center=None):
 # TOGGLE AND CONTROL
 # =============================================================================
 
+def debug():
+    """
+    Unified debug dump: captures one frame and prints everything needed
+    for remote troubleshooting — version, SharpCap info, camera settings,
+    frame properties, API availability, detection state, and config.
+    Users just run debug() and paste the output.
+    """
+    print("")
+    print("=" * 60)
+    print("  COLLIMATION OVERLAY DEBUG DUMP")
+    print("=" * 60)
+
+    # -- Version --
+    print("")
+    print("--- Script ---")
+    print("  Version: %s" % VERSION)
+
+    # -- SharpCap info --
+    print("")
+    print("--- SharpCap ---")
+    try:
+        print("  Version: %s" % SharpCap.Version)
+    except Exception:
+        print("  Version: (unable to read)")
+    try:
+        import sys
+        print("  Python: %s" % sys.version)
+    except Exception:
+        pass
+
+    # -- Camera info --
+    print("")
+    print("--- Camera ---")
+    cam = None
+    try:
+        cam = SharpCap.SelectedCamera
+    except Exception:
+        pass
+    if cam is None:
+        print("  No camera selected!")
+    else:
+        try:
+            print("  Name: %s" % cam.DeviceName)
+        except Exception:
+            print("  Name: (unable to read)")
+        try:
+            for ctrl in cam.Controls:
+                try:
+                    print("  %s = %s" % (ctrl.Name, ctrl.Value))
+                except Exception:
+                    print("  %s = (unreadable)" % ctrl.Name)
+        except Exception:
+            print("  Controls: (unable to enumerate)")
+
+    # -- Detection state --
+    print("")
+    print("--- Detection State ---")
+    print("  enabled: %s" % _state["enabled"])
+    print("  status: %s" % _state["status"])
+    print("  frames: %d" % _state["frame_count"])
+    print("  outer: cx=%s cy=%s r=%s" % (
+        "%.1f" % _state["outer_cx"] if _state["outer_cx"] is not None else "None",
+        "%.1f" % _state["outer_cy"] if _state["outer_cy"] is not None else "None",
+        "%.1f" % _state["outer_r"] if _state["outer_r"] is not None else "None"))
+    print("  inner: cx=%s cy=%s r=%s" % (
+        "%.1f" % _state["inner_cx"] if _state["inner_cx"] is not None else "None",
+        "%.1f" % _state["inner_cy"] if _state["inner_cy"] is not None else "None",
+        "%.1f" % _state["inner_r"] if _state["inner_r"] is not None else "None"))
+    if _state["outer_r"] and _state["inner_r"]:
+        print("  inner/outer ratio: %.2f" % (_state["inner_r"] / _state["outer_r"]))
+    print("  ref_peak: %s" % _state.get("ref_peak"))
+    print("  ref_outer_r: %s" % _state.get("ref_outer_r"))
+    print("  reject_count: %d" % _state.get("reject_count", 0))
+    print("  last_error: %s" % _state["last_error"])
+
+    # -- Config (non-default values highlighted) --
+    print("")
+    print("--- Config ---")
+    for key in sorted(_DEFAULTS.keys()):
+        val = _config.get(key)
+        default = _DEFAULTS.get(key)
+        if key in _COLOR_KEYS:
+            current = _color_to_tuple(val) if val is not None else None
+            if current != default:
+                print("  %s = %s (default: %s) *" % (key, current, default))
+            else:
+                print("  %s = %s" % (key, current))
+        else:
+            if val != default:
+                print("  %s = %s (default: %s) *" % (key, val, default))
+            else:
+                print("  %s = %s" % (key, val))
+
+    # -- Frame capture: image properties + API probing --
+    if cam is None:
+        print("")
+        print("--- Frame Info ---")
+        print("  SKIPPED (no camera)")
+        print("")
+        print("=" * 60)
+        print("Copy everything above and paste it back for analysis.")
+        print("=" * 60)
+        return
+
+    print("")
+    print("--- Frame Info (capturing one frame...) ---")
+
+    _dbg = {"done": False, "info": []}
+
+    def debug_handler(*args):
+        if _dbg["done"]:
+            return
+        _dbg["done"] = True
+        info = _dbg["info"]
+        try:
+            frame = args[1].Frame
+            fi = frame.Info
+            w = fi.Width
+            h = fi.Height
+            info.append("  Resolution: %dx%d" % (w, h))
+            info.append("  BitDepth: %s" % fi.BitDepth)
+            info.append("  ColorPlanes: %s" % fi.ColorPlanes)
+            info.append("  BytesPerPixel: %s" % fi.BytesPerPixel)
+            info.append("  Stride: %s" % fi.Stride)
+            try:
+                info.append("  EffectiveBitDepth: %s" % fi.EffectiveBitDepth)
+            except Exception:
+                pass
+            try:
+                info.append("  Binning: %sx%s" % (fi.BinX, fi.BinY))
+            except Exception:
+                pass
+
+            # frame.Index
+            info.append("")
+            info.append("  --- frame.Index ---")
+            try:
+                info.append("  Value: %s" % frame.Index)
+            except Exception as ex:
+                info.append("  FAILED: %s" % ex)
+
+            # GetAnnotationGraphics
+            info.append("")
+            info.append("  --- GetAnnotationGraphics ---")
+            for test_args, desc in [
+                ((), "no args"),
+                (("collimation",), "string key"),
+            ]:
+                try:
+                    ag = frame.GetAnnotationGraphics(*test_args)
+                    info.append("  (%s) OK: %s" % (desc, type(ag).__name__))
+                    ag.Dispose()
+                    break
+                except Exception as ex:
+                    info.append("  (%s) FAILED: %s" % (desc, ex))
+
+            # GetDrawableBitmap fallback
+            info.append("")
+            info.append("  --- GetDrawableBitmap ---")
+            try:
+                db = frame.GetDrawableBitmap()
+                gfx = db.GetGraphics()
+                info.append("  OK: %s" % type(gfx).__name__)
+                db.Dispose()
+            except Exception as ex:
+                info.append("  FAILED: %s" % ex)
+
+            # Histogram
+            info.append("")
+            info.append("  --- Histogram ---")
+            try:
+                hist = frame.CalculateHistogram()
+                vals = hist.Values
+                n_channels = len(vals)
+                info.append("  Channels: %d" % n_channels)
+                for ch in range(n_channels):
+                    ch_data = vals[ch]
+                    n_bins = len(ch_data)
+                    mx = max(ch_data)
+                    last_nz = max([i for i in range(n_bins) if ch_data[i] > 0]) if any(ch_data[i] > 0 for i in range(n_bins)) else "none"
+                    info.append("  Ch %d: %d bins, max_count=%d, last_nonzero=%s" % (ch, n_bins, mx, last_nz))
+                try:
+                    p999 = hist.GetCentilePointsF(99.9)
+                    info.append("  99.9th percentile: %s" % list(p999))
+                except Exception as ex2:
+                    info.append("  GetCentilePointsF(99.9): FAILED: %s" % ex2)
+                try:
+                    means = hist.GetMeansBelowCentile(99.9)
+                    info.append("  Mean (below 99.9%%): %s" % list(means))
+                except Exception as ex2:
+                    info.append("  GetMeansBelowCentile: FAILED: %s" % ex2)
+            except Exception as ex:
+                info.append("  FAILED: %s" % ex)
+
+            # CutROI
+            info.append("")
+            info.append("  --- CutROI ---")
+            rx = w // 2 - 50
+            ry = h // 2 - 50
+            try:
+                roi = frame.CutROI(Rectangle(rx, ry, 100, 100))
+                ri = roi.Info
+                info.append("  OK: %dx%d, BPP=%s, ColorPlanes=%s" % (
+                    ri.Width, ri.Height, ri.BytesPerPixel, ri.ColorPlanes))
+                roi.Release()
+            except Exception as ex:
+                info.append("  FAILED: %s" % ex)
+
+            # GetFrameBitmap pixel sample
+            info.append("")
+            info.append("  --- Pixel Sample (GetFrameBitmap) ---")
+            try:
+                fbmp = frame.GetFrameBitmap()
+                info.append("  Bitmap: %dx%d, Format=%s" % (fbmp.Width, fbmp.Height, fbmp.PixelFormat))
+                cx = w // 2
+                cy = h // 2
+                pc = fbmp.GetPixel(cx, cy)
+                info.append("  Center(%d,%d): R=%d G=%d B=%d A=%d" % (cx, cy, pc.R, pc.G, pc.B, pc.A))
+                pe = fbmp.GetPixel(10, 10)
+                info.append("  Corner(10,10): R=%d G=%d B=%d A=%d" % (pe.R, pe.G, pe.B, pe.A))
+            except Exception as ex:
+                info.append("  FAILED: %s" % ex)
+
+        except Exception as ex:
+            info.append("  TOP-LEVEL EXCEPTION: %s" % str(ex))
+
+    cam.BeforeFrameDisplay += debug_handler
+    time.sleep(2)
+    cam.BeforeFrameDisplay -= debug_handler
+
+    if _dbg["info"]:
+        for line in _dbg["info"]:
+            print(line)
+    else:
+        print("  No frames received!")
+
+    print("")
+    print("=" * 60)
+    print("Copy everything above and paste it back for analysis.")
+    print("=" * 60)
+
+
 def diagnose():
     """Diagnostic tool: captures one frame and tests all pixel access methods."""
     print("[Diag] Capturing frame - testing all pixel access methods...")
@@ -1491,7 +1798,6 @@ def diagnose():
     cam = SharpCap.SelectedCamera
     cam.BeforeFrameDisplay += diag_handler
 
-    import time
     time.sleep(2)
 
     cam.BeforeFrameDisplay -= diag_handler
@@ -1654,7 +1960,6 @@ def probe_apis():
 
     cam.BeforeFrameDisplay += probe_handler
 
-    import time
     time.sleep(2)
 
     cam.BeforeFrameDisplay -= probe_handler
@@ -1666,21 +1971,6 @@ def probe_apis():
         print("  No frames received!")
     print("")
     print("Copy everything above and paste it back for analysis.")
-
-
-def reset_tracking():
-    """Clear detection state and force re-acquisition of the donut."""
-    _state["outer_cx"] = None
-    _state["outer_cy"] = None
-    _state["outer_r"] = None
-    _state["inner_cx"] = None
-    _state["inner_cy"] = None
-    _state["inner_r"] = None
-    _state["ref_peak"] = None
-    _state["ref_outer_r"] = None
-    _state["reject_count"] = 0
-    _state["status"] = "Searching for donut..."
-    print("[Collimation] Tracking reset")
 
 
 def show_state():
@@ -1704,6 +1994,21 @@ def show_state():
     if _state["outer_r"] and _state["inner_r"]:
         print("  inner/outer ratio: %.2f" % (_state["inner_r"] / _state["outer_r"]))
     print("  last_error: %s" % _state["last_error"])
+
+
+def reset_tracking():
+    """Clear detection state and force re-acquisition of the donut."""
+    _state["outer_cx"] = None
+    _state["outer_cy"] = None
+    _state["outer_r"] = None
+    _state["inner_cx"] = None
+    _state["inner_cy"] = None
+    _state["inner_r"] = None
+    _state["ref_peak"] = None
+    _state["ref_outer_r"] = None
+    _state["reject_count"] = 0
+    _state["status"] = "Searching for donut..."
+    print("[Collimation] Tracking reset")
 
 
 def debug_on():
@@ -1843,6 +2148,8 @@ _SETTINGS_META = [
     ("BOTTOM_BAR_FONT_SIZE",  "Bottom Bar Font Size",  "Colors", "int",   6, 24, 1),
     ("ARROW_LABEL_FONT_SIZE", "Arrow Label Font Size", "Colors", "int",   6, 24, 1),
     # --- Detection tab ---
+    # (Algorithm selector is added manually at top of Detection tab)
+    ("GRAD_WINDOW",                 "Gradient Window (px)",    "Detection", "int",   3, 30, 1),
     ("NUM_RAYS",                    "Number of Rays",          "Detection", "int",   12, 360, 1),
     ("BRIGHTNESS_THRESHOLD_PERCENT","Brightness Threshold (%)", "Detection", "int",   1, 80, 1),
     ("CENTROID_DOWNSAMPLE",         "Centroid Downsample",     "Detection", "int",   1, 16, 1),
@@ -1870,7 +2177,8 @@ def _build_settings_form():
     form.StartPosition = FormStartPosition.CenterScreen
     form.TopMost = True
     try:
-        form.AutoScaleMode = WinFormsAutoScaleMode.Dpi
+        form.AutoScaleMode = WinFormsAutoScaleMode.Font
+        form.AutoScaleDimensions = System.Drawing.SizeF(6.0, 13.0)
     except:
         pass
 
@@ -1901,6 +2209,13 @@ def _build_settings_form():
     btn_reset.Left = 6
     btn_reset.Top = 5
 
+    btn_restart = Button()
+    btn_restart.Text = "Restart"
+    btn_restart.Width = 60
+    btn_restart.Height = 24
+    btn_restart.Left = (form.Width - 60) // 2
+    btn_restart.Top = 5
+
     btn_save = Button()
     btn_save.Text = "Save"
     btn_save.Width = 60
@@ -1909,6 +2224,7 @@ def _build_settings_form():
     btn_save.Top = 5
 
     bottom.Controls.Add(btn_reset)
+    bottom.Controls.Add(btn_restart)
     bottom.Controls.Add(btn_save)
 
     form.Controls.Add(tabs)
@@ -1942,6 +2258,90 @@ def _build_settings_form():
         for c in display_controls:
             c.Enabled = sender.Checked
     cb_enable.CheckedChanged += on_enable_change
+
+    # --- Algorithm selector at top of Detection tab ---
+    from System.Windows.Forms import ComboBox, ComboBoxStyle
+
+    _ALGORITHMS = [
+        ("edge_to_dark",        "Edge to Dark",        "Best for images with diffraction rings.\nFinds sharpest gradient that transitions to background darkness."),
+        ("steepest_gradient",   "Steepest Gradient",   "Good for clean donuts and dim stars.\nFinds the sharpest brightness drop along each ray."),
+        ("threshold_crossing",  "Threshold Crossing",  "Good for high-contrast donuts with clean edges.\nFinds the last point brightness drops below threshold."),
+    ]
+    _algo_values = [a[0] for a in _ALGORITHMS]
+    _algo_labels = [a[1] for a in _ALGORITHMS]
+    _algo_tips = {a[0]: a[2] for a in _ALGORITHMS}
+
+    det_tp = tab_pages["Detection"]
+    det_y = tab_y.get("Detection", 4)
+
+    alg_lbl = Label()
+    alg_lbl.Text = "Algorithm"
+    alg_lbl.Left = 4
+    alg_lbl.Top = det_y + 3
+    alg_lbl.Width = lbl_w
+    alg_lbl.Height = 18
+    font_bold_det = Font(alg_lbl.Font, FontStyle.Bold)
+    alg_lbl.Font = font_bold_det
+    det_tp.Controls.Add(alg_lbl)
+
+    alg_combo = ComboBox()
+    alg_combo.Left = ctrl_left
+    alg_combo.Top = det_y
+    alg_combo.Width = 120
+    alg_combo.Height = 22
+    alg_combo.DropDownStyle = ComboBoxStyle.DropDownList
+    for lbl_text in _algo_labels:
+        alg_combo.Items.Add(lbl_text)
+    cur_algo = _config.get("DETECTION_ALGORITHM", "edge_to_dark")
+    if cur_algo in _algo_values:
+        alg_combo.SelectedIndex = _algo_values.index(cur_algo)
+    else:
+        alg_combo.SelectedIndex = 0
+    det_tp.Controls.Add(alg_combo)
+    det_y += 26
+
+    alg_tip_lbl = Label()
+    alg_tip_lbl.Left = 4
+    alg_tip_lbl.Top = det_y
+    alg_tip_lbl.Width = 240
+    alg_tip_lbl.Height = 36
+    alg_tip_lbl.ForeColor = Color.FromArgb(255, 100, 100, 100)
+    tip_font = Font(alg_tip_lbl.Font.FontFamily, 7.5, FontStyle.Italic)
+    alg_tip_lbl.Font = tip_font
+    alg_tip_lbl.Text = _algo_tips.get(cur_algo, "")
+    det_tp.Controls.Add(alg_tip_lbl)
+    det_y += 40
+
+    # Separator line
+    sep = Label()
+    sep.Left = 4
+    sep.Top = det_y
+    sep.Width = 240
+    sep.Height = 2
+    sep.BorderStyle = System.Windows.Forms.BorderStyle.Fixed3D
+    det_tp.Controls.Add(sep)
+    det_y += 8
+
+    def on_algo_change(sender, e):
+        idx = sender.SelectedIndex
+        if 0 <= idx < len(_algo_values):
+            _config["DETECTION_ALGORITHM"] = _algo_values[idx]
+            alg_tip_lbl.Text = _algo_tips.get(_algo_values[idx], "")
+            # Set recommended GRAD_WINDOW for gradient-based algorithms
+            if _algo_values[idx] == "steepest_gradient":
+                _config["GRAD_WINDOW"] = 5
+            elif _algo_values[idx] == "edge_to_dark":
+                _config["GRAD_WINDOW"] = 10
+            # Update GRAD_WINDOW control if it exists
+            gw_entry = control_map.get("GRAD_WINDOW")
+            if gw_entry and gw_entry[0] is not None:
+                gw_entry[0].Value = System.Decimal(int(_config["GRAD_WINDOW"]))
+            restart()
+            cb_enable.Checked = True
+    alg_combo.SelectedIndexChanged += on_algo_change
+
+    control_map["DETECTION_ALGORITHM"] = (alg_combo, None, None)
+    tab_y["Detection"] = det_y
 
     for key, label_text, tab_name, ctrl_type, c_min, c_max, c_step in _SETTINGS_META:
         tp = tab_pages[tab_name]
@@ -2086,6 +2486,11 @@ def _build_settings_form():
     # --- Button handlers ---
     def on_reset(sender, e):
         reset_config()
+        # Refresh algorithm selector
+        default_algo = _DEFAULTS["DETECTION_ALGORITHM"]
+        if default_algo in _algo_values:
+            alg_combo.SelectedIndex = _algo_values.index(default_algo)
+        alg_tip_lbl.Text = _algo_tips.get(default_algo, "")
         # Refresh all controls
         for key, label_text, tab_name, ctrl_type, c_min, c_max, c_step in _SETTINGS_META:
             entry = control_map.get(key)
@@ -2103,10 +2508,16 @@ def _build_settings_form():
                 ctrl.Value = System.Decimal(int(_config[key]))
         print("[Collimation] Settings reset to defaults in dialog")
 
+    def on_restart(sender, e):
+        restart()
+        # Update the enable checkbox to reflect re-enabled state
+        cb_enable.Checked = True
+
     def on_save(sender, e):
         save_config()
 
     btn_reset.Click += on_reset
+    btn_restart.Click += on_restart
     btn_save.Click += on_save
 
     return form
@@ -2237,6 +2648,27 @@ def detach_handler():
     print("[Collimation] Handler detached")
 
 
+def restart():
+    """Restart the overlay: detach handler, reset all detection state, re-attach."""
+    detach_handler()
+    _state["outer_cx"] = None
+    _state["outer_cy"] = None
+    _state["outer_r"] = None
+    _state["inner_cx"] = None
+    _state["inner_cy"] = None
+    _state["inner_r"] = None
+    _state["ref_peak"] = None
+    _state["ref_outer_r"] = None
+    _state["reject_count"] = 0
+    _state["frame_count"] = 0
+    _state["status"] = "Restarting..."
+    _state["last_error"] = ""
+    _state["enabled"] = True
+    _state["restart_blanking"] = 15  # Show blank "Restarting..." for ~15 frames
+    attach_handler()
+    print("[Collimation] Restarted - searching for donut...")
+
+
 def stop():
     """Fully stop the overlay: detach handler, remove toolbar button, disable."""
     detach_handler()
@@ -2267,7 +2699,7 @@ def setup():
       3. Print usage instructions to the console
     """
     print("=" * 50)
-    print("  COLLIMATION OVERLAY v2.0")
+    print("  COLLIMATION OVERLAY v%s" % VERSION)
     print("=" * 50)
 
     buttons = []
@@ -2290,7 +2722,7 @@ def setup():
     print("Console commands:")
     print("  settings()             - open settings dialog")
     print("  reset_tracking()       - re-detect donut")
-    print("  show_state()           - debug info")
+    print("  debug()                - full diagnostic dump")
     print("  debug_on() / debug_off() - per-frame logging")
     print("  stop()                 - fully stop + remove button")
     print("=" * 50)

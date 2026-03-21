@@ -1662,6 +1662,113 @@ def debug():
             except Exception as ex:
                 info.append("  FAILED: %s" % ex)
 
+            # Fresh analysis on this frame
+            info.append("")
+            info.append("  --- Live Analysis (this frame) ---")
+            try:
+                abmp = frame.GetFrameBitmap()
+                result = analyze_bitmap(abmp)
+                if result is None:
+                    info.append("  No donut detected in this frame")
+                else:
+                    info.append("  Algorithm: %s" % _config.get("DETECTION_ALGORITHM", "edge_to_dark"))
+                    info.append("  Grad window: %d" % _config.get("GRAD_WINDOW", 10))
+                    info.append("  Peak brightness: %.1f" % result["peak"])
+                    info.append("  Threshold: %.1f (%.0f%% of peak)" % (
+                        result["threshold"], result["threshold"] / result["peak"] * 100 if result["peak"] > 0 else 0))
+                    info.append("  Rays found: inner=%d/%d  outer=%d/%d" % (
+                        result["n_inner"], _config["NUM_RAYS"],
+                        result["n_outer"], _config["NUM_RAYS"]))
+                    info.append("  Raw outer: cx=%.1f cy=%.1f r=%.1f" % (
+                        result["outer_cx"], result["outer_cy"], result["outer_r"]))
+                    info.append("  Raw inner: cx=%.1f cy=%.1f r=%.1f" % (
+                        result["inner_cx"], result["inner_cy"], result["inner_r"]))
+                    info.append("  Outer edge spread: %.1f px" % result["outer_spread"])
+                    info.append("  Inner/outer ratio: %.2f" % (result["inner_r"] / result["outer_r"]))
+                    # Donut-to-frame ratio
+                    max_dim = min(w, h)
+                    fill_pct = result["outer_r"] * 2.0 / max_dim * 100
+                    margin_px = max_dim / 2.0 - result["outer_r"]
+                    info.append("  Frame fill: %.0f%% (margin=%.0f px)" % (fill_pct, margin_px))
+                    if fill_pct > 85:
+                        info.append("  WARNING: donut nearly fills frame — outer edge may clip")
+            except Exception as ex:
+                info.append("  Analysis FAILED: %s" % ex)
+
+            # ROI status
+            info.append("")
+            info.append("  --- ROI Status ---")
+            if _state["outer_cx"] is not None and _state["outer_r"] is not None:
+                roi_r = _state.get("ref_outer_r") or _state["outer_r"]
+                margin = int(roi_r * _config["ROI_MARGIN_FACTOR"])
+                roi_x = max(0, int(_state["outer_cx"]) - margin)
+                roi_y = max(0, int(_state["outer_cy"]) - margin)
+                roi_w = min(w - roi_x, margin * 2)
+                roi_h = min(h - roi_y, margin * 2)
+                info.append("  ROI active: %dx%d at (%d,%d)" % (roi_w, roi_h, roi_x, roi_y))
+                info.append("  ROI ref_radius=%.1f, margin=%d, factor=%.1f" % (
+                    roi_r, margin, _config["ROI_MARGIN_FACTOR"]))
+                # Check if ROI clips the donut
+                if _state["outer_r"] is not None:
+                    edge_clearance = min(
+                        _state["outer_cx"] - roi_x,
+                        _state["outer_cy"] - roi_y,
+                        (roi_x + roi_w) - _state["outer_cx"],
+                        (roi_y + roi_h) - _state["outer_cy"]
+                    ) - _state["outer_r"]
+                    info.append("  ROI edge clearance: %.0f px" % edge_clearance)
+                    if edge_clearance < 20:
+                        info.append("  WARNING: ROI barely contains donut — rays may clip")
+            else:
+                info.append("  ROI not active (no tracking yet)")
+
+            # Sample ray brightness profile (4 rays: right, down, left, up)
+            info.append("")
+            info.append("  --- Brightness Profile (4 sample rays) ---")
+            try:
+                prof_bmp = frame.GetFrameBitmap()
+                prof_rect = Rectangle(0, 0, prof_bmp.Width, prof_bmp.Height)
+                prof_bmpdata = None
+                for fmt in [PixelFormat.Format24bppRgb, PixelFormat.Format32bppArgb,
+                            PixelFormat.Format32bppRgb, PixelFormat.Format8bppIndexed]:
+                    try:
+                        prof_bmpdata = prof_bmp.LockBits(prof_rect, ImageLockMode.ReadOnly, fmt)
+                        break
+                    except:
+                        continue
+                if prof_bmpdata is not None:
+                    prof_stride = prof_bmpdata.Stride
+                    prof_total = abs(prof_stride) * prof_bmp.Height
+                    prof_raw = Array.CreateInstance(Byte, prof_total)
+                    Marshal.Copy(prof_bmpdata.Scan0, prof_raw, 0, prof_total)
+                    prof_bmp.UnlockBits(prof_bmpdata)
+                    prof_bpp = abs(prof_stride) // prof_bmp.Width
+                    if prof_bpp < 1:
+                        prof_bpp = 1
+
+                    # Use detected center if available, else frame center
+                    pcx = _state["outer_cx"] if _state["outer_cx"] is not None else w / 2.0
+                    pcy = _state["outer_cy"] if _state["outer_cy"] is not None else h / 2.0
+                    max_prof_len = int(min(w, h) * 0.45)
+
+                    ray_dirs = [(1, 0, "Right"), (0, 1, "Down"), (-1, 0, "Left"), (0, -1, "Up")]
+                    for dx, dy, name in ray_dirs:
+                        samples = []
+                        for dist in range(0, max_prof_len, 3):
+                            rpx = int(pcx + dx * dist)
+                            rpy = int(pcy + dy * dist)
+                            if rpx < 0 or rpx >= w or rpy < 0 or rpy >= h:
+                                break
+                            b = _get_brightness(prof_raw, rpy * abs(prof_stride) + rpx * prof_bpp, prof_bpp)
+                            samples.append(int(b))
+                        # Compact: show every 3rd sample (every 9 pixels)
+                        compact = samples[::3]
+                        info.append("  %s: %s" % (name, " ".join([str(v) for v in compact])))
+                else:
+                    info.append("  Could not lock bitmap for profiling")
+            except Exception as ex:
+                info.append("  Profile FAILED: %s" % ex)
+
         except Exception as ex:
             info.append("  TOP-LEVEL EXCEPTION: %s" % str(ex))
 

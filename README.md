@@ -166,6 +166,17 @@ Offset percentage is relative to the outer circle radius.
 - The button API varies across SharpCap versions. If the button fails to create, the console will show a warning. Use `settings()` in the console instead.
 - Re-running the script automatically removes old buttons before adding new ones.
 
+### Still having issues?
+
+If the troubleshooting steps above don't resolve your issue:
+
+1. Type `debug()` in the SharpCap scripting console and press Enter
+2. Wait a couple of seconds for it to complete
+3. Copy the entire output (everything between the `====` lines)
+4. Post it to the [SharpCap forum](https://forums.sharpcap.co.uk/) along with a description of what you're seeing
+
+The `debug()` output includes your script version, camera settings, detection state, a fresh analysis of the current frame (ray counts, edge spread, brightness profiles), and all configuration — everything needed to diagnose the problem remotely.
+
 ## Console Commands
 
 Type these in the SharpCap scripting console:
@@ -175,7 +186,7 @@ Type these in the SharpCap scripting console:
 | `settings()` | Open the settings palette |
 | `restart()` | Full detection restart (same as Restart button) |
 | `reset_tracking()` | Clear tracking and re-detect the donut |
-| `debug()` | Full diagnostic dump (version, camera, detection state, APIs) |
+| `debug()` | Full diagnostic dump (version, camera, detection state, live analysis, brightness profiles) |
 | `debug_on()` / `debug_off()` | Toggle per-frame debug logging |
 | `stop()` | Fully stop overlay and remove toolbar button |
 | `save_config()` / `load_config()` | Manually save or reload settings |

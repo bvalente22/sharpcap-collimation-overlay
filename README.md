@@ -27,6 +27,7 @@ Click the **Coll Settings** toolbar button (or type `settings()` in the console)
 - **Overlay Details** — detailed stats panel (top-left)
 - **Bottom Numerical Details** — X/Y offset readout bar
 - **Correction Arrows** — directional arrows showing which way to adjust
+- **Target Brightness** — brightness level indicator with dim/OK/bright zones
 
 ### Colors Tab
 
@@ -57,15 +58,15 @@ Click the **Coll Settings** toolbar button (or type `settings()` in the console)
 
 ## Detection Algorithms
 
-The script offers three outer edge detection algorithms, selectable from the Detection tab. The inner edge detection (secondary mirror shadow) is the same for all — a simple dark-to-bright threshold crossing that works reliably because the shadow edge is sharp.
+The script offers three outer edge detection algorithms, selectable from the Detection tab. The inner edge uses a gradient-based approach (steepest dark-to-bright transition) that is robust across a wide range of brightness levels.
 
 | Algorithm | Best For | How It Works |
 |-----------|----------|--------------|
-| **Edge to Dark** (default) | Stars with prominent diffraction rings | Finds the steepest brightness gradient where the brightness drops below the threshold. Ignores dips between bright diffraction rings. |
+| **Threshold Crossing** (default) | Most images — reliable across brightness levels and diffraction rings | Finds the last point where brightness crosses below the threshold. Accurate and stable for typical donut patterns. |
+| **Edge to Dark** | Stars with prominent diffraction rings | Finds the steepest brightness gradient where the brightness drops below the threshold. Ignores dips between bright diffraction rings. |
 | **Steepest Gradient** | Clean donuts, dim stars | Finds the single sharpest brightness drop along each ray. Simple and fast, but can latch onto diffraction ring edges. |
-| **Threshold Crossing** | High-contrast donuts with clean edges | Finds the last point where brightness crosses below the threshold. Very simple and reliable when edges are well-defined. |
 
-**Tip:** If the outer circle wobbles or appears offset on a well-collimated star, try switching algorithms. "Edge to Dark" handles diffraction rings best; "Steepest Gradient" may work better for dim or noisy images.
+**Tip:** If the outer circle wobbles or appears too large, try switching algorithms. "Threshold Crossing" is the most reliable in most cases; "Edge to Dark" may help with heavy diffraction rings.
 
 The **Gradient Window** setting controls how many pixels are averaged when computing brightness gradients. A larger window (10-15) smooths over diffraction ring structure; a smaller window (3-5) is more precise for clean edges.
 
@@ -81,6 +82,7 @@ The **Gradient Window** setting controls how many pixels are averaged when compu
 | **Cyan arrows** | Direction the inner circle needs to move to become concentric |
 | **Bottom bar** | X and Y offset with correction direction and color-coded severity |
 | **Info panel** | Full stats: offset in px/%, direction, radii, quality rating |
+| **Brightness scale** | Horizontal bar showing current brightness level with OK/dim/bright zones |
 
 ### Quality Ratings
 
@@ -99,9 +101,22 @@ Offset percentage is relative to the outer circle radius.
 ### Star Selection and Brightness
 
 - Choose a **bright, isolated star** — the script locks onto the brightest object in the frame, so avoid crowded fields or double stars.
-- **Ideal brightness:** Use SharpCap's histogram to check. The peak should land somewhere in the **middle third of the histogram** (roughly 80-180 on a 0-255 scale). This gives the detector plenty of contrast to work with.
+- **Ideal brightness:** Use SharpCap's histogram to check. The peak should land somewhere in the **middle third of the histogram** (roughly 30%-70% of the maximum value). This gives the detector plenty of contrast to work with.
 - If the histogram peak is bunched up at the far right, the star is saturated — reduce exposure or gain. If it barely rises above the left side, increase exposure or gain.
 - Brighter stars (mag 1-3) are easier to work with since they produce a strong, well-defined donut at shorter exposures.
+- The script supports both **8-bit and 16-bit** image formats. If your camera outputs 16-bit data, the overlay works automatically — no configuration needed.
+
+### Brightness Scale
+
+The overlay includes an optional **brightness scale bar** (shown above the bottom bar) that displays the current image brightness as a percentage of the sensor's maximum value. The scale has three zones:
+
+| Zone | Range | Color | Meaning |
+|------|-------|-------|---------|
+| **Too dim** | 0-26% | Red | Increase exposure or gain — weak signal produces noisy edges and unreliable detection |
+| **OK** | 26-90% | Green | Usable range — aim for the middle for best results |
+| **Too bright** | 90-100% | Red | Reduce exposure or gain — bloom and clipping cause inaccurate edge detection |
+
+A vertical marker shows the current brightness level and updates in real time as you adjust exposure or gain. The scale can be toggled on/off from the **Display** tab in the settings palette.
 
 ### Defocus Amount
 

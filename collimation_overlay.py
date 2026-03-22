@@ -101,6 +101,7 @@ _DEFAULTS = {
     "SHOW_BOTTOM_BAR": True,             # X/Y offset readout bar (bottom)
     "SHOW_CORRECTION_ARROWS": True,      # Directional correction arrows + labels
     "SHOW_ALIGNMENT_CROSSHAIRS": False,  # Full-diameter crosshairs for visual alignment
+    "SHOW_BRIGHTNESS_SCALE": True,       # Brightness scale bar above bottom bar
     # Overlay colors (ARGB)
     "OUTER_CIRCLE_COLOR": (220, 255, 60, 60),      # Red - primary mirror edge
     "INNER_CIRCLE_COLOR": (220, 60, 255, 60),       # Green - secondary shadow edge
@@ -134,7 +135,7 @@ _DEFAULTS = {
     # Performance
     "ANALYSIS_INTERVAL": 2,              # Analyze every Nth frame
     # Outer edge detection algorithm
-    "DETECTION_ALGORITHM": "edge_to_dark",  # "edge_to_dark", "steepest_gradient", "threshold_crossing"
+    "DETECTION_ALGORITHM": "threshold_crossing",  # "threshold_crossing", "edge_to_dark", "steepest_gradient"
     "GRAD_WINDOW": 10,                   # Pixels to average for gradient calculation
 }
 
@@ -315,6 +316,7 @@ _state = {
     "debug_frames": 0,      # Frames logged since debug enabled
     "settings_form": None,  # Reference to open SettingsForm
     "restart_blanking": 0,  # Frames remaining to show blank overlay after restart
+    "brightness_pct": None,  # Current brightness as % of max (0-100), None if unknown
 }
 
 
@@ -420,22 +422,32 @@ def reject_outliers_and_refit(points, cx, cy, radius):
 #   1. Find the approximate center using brightness-weighted centroid
 #   2. Refine the center using only bright pixels near the initial centroid
 #   3. Cast NUM_RAYS radial rays outward from center. Along each ray, detect:
-#      - Inner edge: first dark-to-bright transition (secondary shadow boundary)
-#      - Outer edge: first bright-to-dark transition after that (primary mirror boundary)
+#      - Inner edge: steepest dark-to-bright gradient (secondary shadow boundary)
+#      - Outer edge: steepest bright-to-dark transition after that (primary mirror boundary)
 #   4. Fit circles to the inner and outer edge point sets
 #   5. Reject outliers and refit for higher accuracy
 #   6. Validate: inner radius < outer radius, centers not too far apart, etc.
 
-def _get_brightness(pixels, offset, bpp):
+def _get_brightness(pixels, offset, bpp, bpc=1):
     """Extract grayscale brightness from raw byte array at given byte offset.
-    For RGB (bpp>=3), averages the three channels. For mono, returns the byte value."""
+    For RGB (bpp>=3), averages the three channels. For mono, returns the byte value.
+    bpc: bytes per channel (1 for 8-bit, 2 for 16-bit). 16-bit values are
+    normalized to 0-255 range by shifting right 8 bits."""
+    if bpc == 2:
+        if bpp >= 6:  # 48bpp RGB or 64bpp ARGB
+            r = pixels[offset] + pixels[offset + 1] * 256
+            g = pixels[offset + 2] + pixels[offset + 3] * 256
+            b = pixels[offset + 4] + pixels[offset + 5] * 256
+            return (r + g + b) / 3.0 / 256.0
+        else:  # 16bpp mono
+            return (pixels[offset] + pixels[offset + 1] * 256) / 256.0
     if bpp >= 3:
         return (pixels[offset] + pixels[offset + 1] + pixels[offset + 2]) / 3.0
     else:
         return float(pixels[offset])
 
 
-def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, approx_center=None):
+def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, approx_center=None, bpc=1):
     """
     Analyze raw byte pixel data (from LockBits) for a donut pattern.
 
@@ -446,6 +458,7 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         width, height: image dimensions in pixels
         peak_override: pre-computed peak brightness (from CalculateHistogram)
         approx_center: (cx, cy) from previous tracking, skips coarse centroid scan
+        bpc: bytes per channel (1 for 8-bit, 2 for 16-bit)
 
     Returns:
         Dict with inner/outer circle parameters, or None if no donut found.
@@ -469,7 +482,7 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         for y in range(0, height, step):
             row_off = y * stride
             for x in range(0, width, step):
-                b = _get_brightness(raw, row_off + x * bpp, bpp)
+                b = _get_brightness(raw, row_off + x * bpp, bpp, bpc)
                 if b > peak:
                     peak = b
         if peak < 25.0:
@@ -489,7 +502,7 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         for y in range(0, height, step):
             row_off = y * stride
             for x in range(0, width, step):
-                b = _get_brightness(raw, row_off + x * bpp, bpp)
+                b = _get_brightness(raw, row_off + x * bpp, bpp, bpc)
                 if b > peak:
                     peak = b
                 if b > 15.0:  # Ignore pixels below noise floor
@@ -519,7 +532,7 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
     for y in range(y_min, y_max, step2):
         row_off = y * stride
         for x in range(x_min, x_max, step2):
-            b = _get_brightness(raw, row_off + x * bpp, bpp)
+            b = _get_brightness(raw, row_off + x * bpp, bpp, bpc)
             if b > threshold:
                 sum_bx2 += x * b
                 sum_by2 += y * b
@@ -543,10 +556,8 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         cos_a = math.cos(angle)
         sin_a = math.sin(angle)
 
-        found_inner = False
-        in_bright = False
-        ray_samples = []  # (dist, px, py, brightness) collected after inner edge
-
+        # Collect all samples along the ray first
+        all_samples = []  # (dist, px, py, brightness)
         for dist in range(3, max_ray_len, ray_step):
             px = int(approx_cx + cos_a * dist)
             py = int(approx_cy + sin_a * dist)
@@ -554,25 +565,40 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
             if px < 0 or px >= width or py < 0 or py >= height:
                 break
 
-            b = _get_brightness(raw, py * stride + px * bpp, bpp)
-            is_bright = b > threshold
+            b = _get_brightness(raw, py * stride + px * bpp, bpp, bpc)
+            all_samples.append((dist, px, py, b))
 
-            if not in_bright and is_bright:
-                # Transition: dark -> bright = inner edge of the donut ring
-                if not found_inner:
-                    inner_points.append((px, py))
-                    found_inner = True
-                in_bright = True
+        if len(all_samples) < grad_window * 3:
+            continue
 
-            if found_inner:
-                ray_samples.append((dist, px, py, b))
+        # --- Inner edge: steepest dark-to-bright gradient ---
+        # Find the steepest rising gradient where the "after" side is bright.
+        # This is robust to bloom flooding the central shadow with light.
+        best_inner_grad = 0.0
+        best_inner_idx = -1
+        for j in range(grad_window, len(all_samples) - grad_window):
+            avg_before = 0.0
+            avg_after = 0.0
+            for k in range(grad_window):
+                avg_before += all_samples[j - 1 - k][3]
+                avg_after += all_samples[j + k][3]
+            avg_before /= grad_window
+            avg_after /= grad_window
+            if avg_after > threshold and avg_after > 1.0:
+                grad = (avg_after - avg_before) / avg_after
+                if grad > best_inner_grad:
+                    best_inner_grad = grad
+                    best_inner_idx = j
 
-            # Stop collecting well past the expected outer edge
-            if found_inner and not is_bright and len(ray_samples) > grad_window * 2:
-                pass
-            if found_inner and not is_bright and len(ray_samples) > grad_window * 3:
-                if b < 5.0:
-                    break
+        if best_inner_idx >= 0 and best_inner_grad > 0.3:
+            _, ipx, ipy, _ = all_samples[best_inner_idx]
+            inner_points.append((ipx, ipy))
+            # Build ray_samples from inner edge onward for outer detection
+            ray_samples = all_samples[best_inner_idx:]
+            found_inner = True
+        else:
+            ray_samples = []
+            found_inner = False
 
         # --- Outer edge detection (algorithm-dependent) ---
         if algorithm == "threshold_crossing":
@@ -764,10 +790,8 @@ def analyze_donut_floats(pixels, width, height):
         cos_a = math.cos(angle)
         sin_a = math.sin(angle)
 
-        found_inner = False
-        in_bright = False
-        ray_samples = []
-
+        # Collect all samples along the ray first
+        all_samples = []
         for dist in range(3, max_ray_len, ray_step):
             px = int(approx_cx + cos_a * dist)
             py = int(approx_cy + sin_a * dist)
@@ -776,20 +800,36 @@ def analyze_donut_floats(pixels, width, height):
                 break
 
             b = pixels[py * width + px]
-            is_bright = b > threshold
+            all_samples.append((dist, px, py, b))
 
-            if not in_bright and is_bright:
-                if not found_inner:
-                    inner_points.append((px, py))
-                    found_inner = True
-                in_bright = True
+        if len(all_samples) < grad_window * 3:
+            continue
 
-            if found_inner:
-                ray_samples.append((dist, px, py, b))
+        # --- Inner edge: steepest dark-to-bright gradient ---
+        best_inner_grad = 0.0
+        best_inner_idx = -1
+        for j in range(grad_window, len(all_samples) - grad_window):
+            avg_before = 0.0
+            avg_after = 0.0
+            for k in range(grad_window):
+                avg_before += all_samples[j - 1 - k][3]
+                avg_after += all_samples[j + k][3]
+            avg_before /= grad_window
+            avg_after /= grad_window
+            if avg_after > threshold and avg_after > 1.0:
+                grad = (avg_after - avg_before) / avg_after
+                if grad > best_inner_grad:
+                    best_inner_grad = grad
+                    best_inner_idx = j
 
-            if found_inner and not is_bright and len(ray_samples) > grad_window * 3:
-                if b < 5.0:
-                    break
+        if best_inner_idx >= 0 and best_inner_grad > 0.3:
+            _, ipx, ipy, _ = all_samples[best_inner_idx]
+            inner_points.append((ipx, ipy))
+            ray_samples = all_samples[best_inner_idx:]
+            found_inner = True
+        else:
+            ray_samples = []
+            found_inner = False
 
         # Find outer edge as point of steepest relative brightness decline
         if found_inner and len(ray_samples) > grad_window * 2:
@@ -960,6 +1000,33 @@ def _get_histogram_peak(frame):
         return None
 
 
+def _evaluate_brightness(frame):
+    """Check histogram and update _state['brightness_pct'] (0-100 scale)."""
+    try:
+        hist = frame.CalculateHistogram()
+        p999 = hist.GetCentilePointsF(99.9)
+
+        # Use the brightest channel's 99.9th percentile
+        max_p999 = 0.0
+        for i in range(min(3, len(p999))):
+            v = float(p999[i])
+            if v > max_p999:
+                max_p999 = v
+
+        # Determine max value based on bit depth
+        try:
+            bit_depth = frame.Info.BitDepth
+        except:
+            bit_depth = 8
+        max_val = (1 << bit_depth) - 1 if bit_depth > 0 else 255
+
+        pct = max_p999 / max_val * 100.0 if max_val > 0 else 0
+        pct = min(100.0, max(0.0, pct))
+        _state["brightness_pct"] = smooth_val(_state.get("brightness_pct"), pct, 0.8)
+    except:
+        _state["brightness_pct"] = None
+
+
 def _try_cut_roi(frame):
     """Cut a region of interest around the tracked donut position."""
     try:
@@ -999,6 +1066,8 @@ def draw_overlay(gfx, width, height):
 
     if ocx is None or icx is None:
         draw_status_text(gfx, "Searching for donut...")
+        if _config["SHOW_BRIGHTNESS_SCALE"] and _state.get("brightness_pct") is not None:
+            draw_brightness_scale(gfx, width, height, _state["brightness_pct"])
         return
 
     # --- Circles ---
@@ -1132,6 +1201,76 @@ def draw_overlay(gfx, width, height):
     # --- Bottom bar ---
     if _config["SHOW_BOTTOM_BAR"]:
         draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore)
+
+    # --- Brightness scale ---
+    if _config["SHOW_BRIGHTNESS_SCALE"] and _state.get("brightness_pct") is not None:
+        draw_brightness_scale(gfx, width, height, _state["brightness_pct"])
+
+
+def draw_brightness_scale(gfx, width, height, pct):
+    """Draw a brightness scale bar above the bottom bar showing current brightness level."""
+    bar_font_size = _config["BOTTOM_BAR_FONT_SIZE"]
+    bottom_bar_h = float(bar_font_size + 16) if _config["SHOW_BOTTOM_BAR"] else 0.0
+    scale_h = 18.0
+    scale_y = float(height) - bottom_bar_h - scale_h
+    margin = float(width) * 0.05
+    scale_x = margin
+    scale_w = float(width) - margin * 2.0
+    bar_x = scale_x
+    bar_w = scale_w
+
+    # Background
+    bg = SolidBrush(Color.FromArgb(180, 0, 0, 0))
+    gfx.FillRectangle(bg, RectangleF(scale_x, scale_y, scale_w, scale_h))
+    bg.Dispose()
+
+    # "Too dim" zone (0-26%) - red
+    dim_w = bar_w * 0.26
+    dim_brush = SolidBrush(Color.FromArgb(80, 255, 60, 60))
+    gfx.FillRectangle(dim_brush, RectangleF(bar_x, scale_y + 2.0, float(dim_w), scale_h - 4.0))
+    dim_brush.Dispose()
+
+    # "OK" zone (26-90%) - green
+    ok_x = bar_x + dim_w
+    ok_w = bar_w * 0.64
+    ok_brush = SolidBrush(Color.FromArgb(50, 60, 255, 60))
+    gfx.FillRectangle(ok_brush, RectangleF(float(ok_x), scale_y + 2.0, float(ok_w), scale_h - 4.0))
+    ok_brush.Dispose()
+
+    # "Too bright" zone (90-100%) - red
+    bright_x = bar_x + dim_w + ok_w
+    bright_w = bar_w * 0.10
+    bright_brush = SolidBrush(Color.FromArgb(80, 255, 60, 60))
+    gfx.FillRectangle(bright_brush, RectangleF(float(bright_x), scale_y + 2.0, float(bright_w), scale_h - 4.0))
+    bright_brush.Dispose()
+
+    # Zone boundary lines
+    boundary_pen = Pen(Color.FromArgb(100, 255, 255, 255), 1.0)
+    gfx.DrawLine(boundary_pen, float(ok_x), scale_y + 2.0, float(ok_x), scale_y + scale_h - 2.0)
+    gfx.DrawLine(boundary_pen, float(bright_x), scale_y + 2.0, float(bright_x), scale_y + scale_h - 2.0)
+    boundary_pen.Dispose()
+
+    # Current brightness marker (vertical line)
+    marker_x = bar_x + bar_w * min(1.0, max(0.0, pct / 100.0))
+    if pct > 90 or pct < 26:
+        marker_color = Color.FromArgb(255, 255, 80, 80)
+    else:
+        marker_color = Color.FromArgb(255, 0, 255, 0)
+    marker_pen = Pen(marker_color, 2.0)
+    gfx.DrawLine(marker_pen, float(marker_x), scale_y + 1.0, float(marker_x), scale_y + scale_h - 1.0)
+    marker_pen.Dispose()
+
+    # Show percentage next to marker
+    font = Font(FontFamily.GenericMonospace, 8.0, FontStyle.Regular)
+    val_text = "%d%%" % int(pct)
+    val_brush = SolidBrush(marker_color)
+    val_x = float(marker_x) + 4.0
+    # Flip to left side if near right edge
+    if pct > 85:
+        val_x = float(marker_x) - 28.0
+    gfx.DrawString(val_text, font, val_brush, val_x, scale_y + 3.0)
+    val_brush.Dispose()
+    font.Dispose()
 
 
 def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
@@ -1374,6 +1513,9 @@ def on_before_frame_display(*args):
                     except:
                         pass
 
+            # Evaluate brightness on the full frame (not ROI)
+            _evaluate_brightness(frame)
+
         # --- Drawing phase (runs every frame for smooth overlay) ---
         info = frame.Info
         draw_overlay(gfx, info.Width, info.Height)
@@ -1406,7 +1548,9 @@ def analyze_bitmap(bmp, peak_override=None, approx_center=None):
     height = bmp.Height
     rect = Rectangle(0, 0, width, height)
 
+    # Try 8-bit formats first (preferred — simplest pixel data)
     bmpdata = None
+    bpc = 1  # bytes per channel
     for fmt in [PixelFormat.Format24bppRgb, PixelFormat.Format32bppArgb,
                 PixelFormat.Format32bppRgb, PixelFormat.Format8bppIndexed]:
         try:
@@ -1415,9 +1559,23 @@ def analyze_bitmap(bmp, peak_override=None, approx_center=None):
         except:
             continue
 
+    # If 8-bit formats fail, try 16-bit formats
+    if bmpdata is None:
+        for fmt in [PixelFormat.Format48bppRgb, PixelFormat.Format16bppGrayScale]:
+            try:
+                bmpdata = bmp.LockBits(rect, ImageLockMode.ReadOnly, fmt)
+                bpc = 2
+                break
+            except:
+                continue
+
+    # Last resort: use the bitmap's native format and detect bpc from it
     if bmpdata is None:
         try:
             bmpdata = bmp.LockBits(rect, ImageLockMode.ReadOnly, bmp.PixelFormat)
+            fmt_name = str(bmp.PixelFormat)
+            if "48bpp" in fmt_name or "16bpp" in fmt_name or "64bpp" in fmt_name:
+                bpc = 2
         except Exception as ex:
             _state["last_error"] = "LockBits failed: %s" % str(ex)
             return None
@@ -1432,7 +1590,7 @@ def analyze_bitmap(bmp, peak_override=None, approx_center=None):
     if bpp < 1:
         bpp = 1
 
-    return analyze_donut_raw(raw, abs(stride), bpp, width, height, peak_override, approx_center)
+    return analyze_donut_raw(raw, abs(stride), bpp, width, height, peak_override, approx_center, bpc)
 
 
 # =============================================================================
@@ -1671,7 +1829,7 @@ def debug():
                 if result is None:
                     info.append("  No donut detected in this frame")
                 else:
-                    info.append("  Algorithm: %s" % _config.get("DETECTION_ALGORITHM", "edge_to_dark"))
+                    info.append("  Algorithm: %s" % _config.get("DETECTION_ALGORITHM", "threshold_crossing"))
                     info.append("  Grad window: %d" % _config.get("GRAD_WINDOW", 10))
                     info.append("  Peak brightness: %.1f" % result["peak"])
                     info.append("  Threshold: %.1f (%.0f%% of peak)" % (
@@ -1729,6 +1887,7 @@ def debug():
                 prof_bmp = frame.GetFrameBitmap()
                 prof_rect = Rectangle(0, 0, prof_bmp.Width, prof_bmp.Height)
                 prof_bmpdata = None
+                prof_bpc = 1
                 for fmt in [PixelFormat.Format24bppRgb, PixelFormat.Format32bppArgb,
                             PixelFormat.Format32bppRgb, PixelFormat.Format8bppIndexed]:
                     try:
@@ -1736,6 +1895,14 @@ def debug():
                         break
                     except:
                         continue
+                if prof_bmpdata is None:
+                    for fmt in [PixelFormat.Format48bppRgb, PixelFormat.Format16bppGrayScale]:
+                        try:
+                            prof_bmpdata = prof_bmp.LockBits(prof_rect, ImageLockMode.ReadOnly, fmt)
+                            prof_bpc = 2
+                            break
+                        except:
+                            continue
                 if prof_bmpdata is not None:
                     prof_stride = prof_bmpdata.Stride
                     prof_total = abs(prof_stride) * prof_bmp.Height
@@ -1759,7 +1926,7 @@ def debug():
                             rpy = int(pcy + dy * dist)
                             if rpx < 0 or rpx >= w or rpy < 0 or rpy >= h:
                                 break
-                            b = _get_brightness(prof_raw, rpy * abs(prof_stride) + rpx * prof_bpp, prof_bpp)
+                            b = _get_brightness(prof_raw, rpy * abs(prof_stride) + rpx * prof_bpp, prof_bpp, prof_bpc)
                             samples.append(int(b))
                         # Compact: show every 3rd sample (every 9 pixels)
                         compact = samples[::3]
@@ -2240,6 +2407,7 @@ _SETTINGS_META = [
     ("SHOW_INFO_PANEL",           "Overlay Details",            "Display", "bool", None, None, None),
     ("SHOW_BOTTOM_BAR",           "Bottom Numerical Details",   "Display", "bool", None, None, None),
     ("SHOW_CORRECTION_ARROWS",    "Correction Arrows",          "Display", "bool", None, None, None),
+    ("SHOW_BRIGHTNESS_SCALE",     "Target Brightness",          "Display", "bool", None, None, None),
     # --- Appearance tab ---
     ("OUTER_CIRCLE_COLOR",    "Outer Circle Color",    "Colors", "color", None, None, None),
     ("INNER_CIRCLE_COLOR",    "Inner Circle Color",    "Colors", "color", None, None, None),
@@ -2399,7 +2567,7 @@ def _build_settings_form():
     alg_combo.DropDownStyle = ComboBoxStyle.DropDownList
     for lbl_text in _algo_labels:
         alg_combo.Items.Add(lbl_text)
-    cur_algo = _config.get("DETECTION_ALGORITHM", "edge_to_dark")
+    cur_algo = _config.get("DETECTION_ALGORITHM", "threshold_crossing")
     if cur_algo in _algo_values:
         alg_combo.SelectedIndex = _algo_values.index(cur_algo)
     else:

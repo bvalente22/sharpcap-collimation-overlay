@@ -14,33 +14,96 @@ An IronPython script for SharpCap Pro that automatically detects a defocused sta
 2. Point at a bright star and defocus until you see a clear donut shape
 3. Open the scripting console: **Tools > Scripting Console**
 4. In the console: **File > Run Script** and select `collimation_overlay.py`
-5. The overlay appears immediately. Click the **Coll Settings** toolbar button to open the settings palette.
+5. The settings palette opens automatically and the overlay begins detecting
+
+To stop the overlay, close the settings palette (X button or **Close** button). To restart, simply re-run the script.
+
+## Optimizing the Donut for Accurate Detection
+
+Getting the best results requires a well-sized, well-exposed donut. The overlay provides two real-time guides to help you dial in the optimal settings.
+
+### Step 1: Get the Right Brightness
+
+Adjust your camera's **exposure** and **gain** until the **Target Brightness** bar (horizontal, above the bottom bar) shows the marker in the **green zone** (26–90%). Aim for the middle of the green zone for best results.
+
+| Zone | Range | Color | What to Do |
+|------|-------|-------|------------|
+| Too dim | 0–26% | Red | Increase exposure or gain — weak signal means noisy edges |
+| OK | 26–90% | Green | Good range — aim for the middle |
+| Too bright | 90–100% | Red | Reduce exposure or gain — bloom and clipping distort edges |
+
+### Step 2: Get the Right Size
+
+The **Target Size** bar (vertical, right edge) shows how much of the frame the donut fills. Adjust your **focuser** (defocus more or less) until the marker lands in the **green zone** (20–60% fill).
+
+| Zone | Fill % | Color | What to Do |
+|------|--------|-------|------------|
+| Too small | 0–15% | Red | Defocus more — sub-pixel errors dominate at this size |
+| Marginal | 15–20% | Yellow | Workable but not ideal |
+| Ideal | 20–60% | Green | Best accuracy for detection |
+| Marginal | 60–70% | Yellow | Getting large — risk of edge clipping |
+| Too large | 70–100% | Red | Focus inward — outer edge may clip at frame boundary |
+
+The fill percentage is the outer circle diameter divided by the shorter frame dimension. You can also set a smaller **ROI (Capture Area)** in SharpCap's camera settings to increase the relative fill without changing focus.
+
+### Step 3: Verify Detection
+
+Once both bars are green, check that the red (outer) and green (inner) overlay circles match the donut edges visually. If the outer circle doesn't look right, see [Choosing an Algorithm](#choosing-an-algorithm) below.
+
+Both indicator bars can be toggled on/off from the **Display** tab in the settings palette.
+
+## Choosing an Algorithm
+
+The script offers three outer edge detection algorithms, selectable from the **Detection** tab. Each has strengths for different donut shapes. The inner edge always uses a gradient-based approach that works well across all conditions.
+
+| Algorithm | Best For | How It Works |
+|-----------|----------|--------------|
+| **Threshold Crossing** (default) | Most images — reliable and stable | Finds where brightness crosses below the threshold. Works consistently across different brightness levels and ring patterns. Try this first. |
+| **Edge to Dark** | Prominent diffraction rings | Finds the steepest brightness drop that transitions to darkness. Ignores dips between bright rings by requiring the "after" side to be below threshold. |
+| **Steepest Gradient** | Clean donuts, dim stars | Finds the sharpest brightness drop along each ray. Fast and precise for clean edges, but can latch onto diffraction ring edges on complex donuts. |
+
+### When to Switch Algorithms
+
+- **Outer circle is wobbly or too large** → Try **Threshold Crossing** — it's the most stable for general use
+- **Donut has visible diffraction rings** (concentric bright rings around the main ring) → Try **Edge to Dark** — it skips past ring-to-ring dips
+- **Donut is very dim or has clean, sharp edges** → Try **Steepest Gradient** — it's most precise when there's a single clear edge
+- **Outer circle includes black areas inside the ring** → The edge is being detected too far out. Try **Threshold Crossing** or reduce **Gradient Window**
+
+### Gradient Window
+
+The **Gradient Window** setting (Detection tab) controls how many pixels are averaged when computing brightness gradients. This only affects the gradient-based algorithms (Edge to Dark and Steepest Gradient); Threshold Crossing doesn't use it.
+
+- **Larger window (8–15):** Smooths over diffraction ring structure. Better for complex donuts with multiple rings.
+- **Smaller window (3–5):** More precise for clean, sharp edges. Better for dim stars without rings.
+
+The script automatically adapts the window size for small donuts, so you generally don't need to change this unless you see detection issues.
 
 ## Settings Palette
 
-Click the **Coll Settings** toolbar button (or type `settings()` in the console) to open the settings palette. All changes apply live to the overlay in real time.
+The settings palette opens automatically when the script runs. You can also reopen it with `settings()` in the console. All changes apply live.
 
 ### Display Tab
 
 - **Enable Overlay** — master on/off toggle
-- **Detection Circles** / **Centering Crosshairs** — choose between fitted circles or full-diameter crosshairs (mutually exclusive)
+- **Detection Circles** / **Centering Crosshairs** — choose between fitted circles or full-diameter crosshairs
 - **Overlay Details** — detailed stats panel (top-left)
 - **Bottom Numerical Details** — X/Y offset readout bar
 - **Correction Arrows** — directional arrows showing which way to adjust
-- **Target Brightness** — brightness level indicator with dim/OK/bright zones
+- **Target Brightness** — horizontal brightness level indicator
+- **Target Size** — vertical donut size indicator
 
 ### Colors Tab
 
-- Color pickers for all overlay elements (outer circle, inner circle, crosshairs, offset line, text, background)
-- Line widths for circles, crosshairs, and offset lines
+- Color pickers for all overlay elements
+- Line widths for circles, crosshairs, and offset lines (default 1.0px — suitable for viewing at 200–300% zoom)
 - Font sizes for info panel, bottom bar, and arrow labels
 
 ### Detection Tab
 
-- **Algorithm** — choose the outer edge detection method (see [Detection Algorithms](#detection-algorithms))
-- **Gradient Window** — pixel averaging window for gradient-based algorithms (higher = smoother, less sensitive to rings)
-- **Number of Rays** — radial rays cast for edge detection (more = accurate, slower)
-- **Brightness Threshold** — % of peak brightness that defines the donut edge
+- **Algorithm** — outer edge detection method (see above)
+- **Gradient Window** — pixel averaging window for gradient calculations
+- **Number of Rays** — radial rays for edge detection (more = accurate, slower)
+- **Brightness Threshold** — % of peak brightness defining the donut edge
 - **Smoothing Factor** — exponential smoothing across frames (0 = none, 0.9 = very smooth)
 - Tracking validation parameters (radius change limits, center jump limits, stale frame limit)
 
@@ -53,22 +116,9 @@ Click the **Coll Settings** toolbar button (or type `settings()` in the console)
 | Button | Action |
 |--------|--------|
 | **Reset** | Reset all settings to defaults |
-| **Restart** | Full detection restart — clears all tracking and re-searches for the donut |
-| **Save** | Save current settings to `collimation_settings.cfg` (persists across sessions) |
-
-## Detection Algorithms
-
-The script offers three outer edge detection algorithms, selectable from the Detection tab. The inner edge uses a gradient-based approach (steepest dark-to-bright transition) that is robust across a wide range of brightness levels.
-
-| Algorithm | Best For | How It Works |
-|-----------|----------|--------------|
-| **Threshold Crossing** (default) | Most images — reliable across brightness levels and diffraction rings | Finds the last point where brightness crosses below the threshold. Accurate and stable for typical donut patterns. |
-| **Edge to Dark** | Stars with prominent diffraction rings | Finds the steepest brightness gradient where the brightness drops below the threshold. Ignores dips between bright diffraction rings. |
-| **Steepest Gradient** | Clean donuts, dim stars | Finds the single sharpest brightness drop along each ray. Simple and fast, but can latch onto diffraction ring edges. |
-
-**Tip:** If the outer circle wobbles or appears too large, try switching algorithms. "Threshold Crossing" is the most reliable in most cases; "Edge to Dark" may help with heavy diffraction rings.
-
-The **Gradient Window** setting controls how many pixels are averaged when computing brightness gradients. A larger window (10-15) smooths over diffraction ring structure; a smaller window (3-5) is more precise for clean edges.
+| **Restart** | Full detection restart — clears tracking and re-searches for the donut |
+| **Save** | Save settings to `collimation_settings.cfg` (persists across sessions) |
+| **Close** | Stop the overlay and close the palette |
 
 ## Reading the Overlay
 
@@ -79,10 +129,11 @@ The **Gradient Window** setting controls how many pixels are averaged when compu
 | **Yellow crosshair** | Center of the outer circle |
 | **Green crosshair** | Center of the inner circle |
 | **Cyan dashed line** | Offset vector between the two centers |
-| **Cyan arrows** | Direction the inner circle needs to move to become concentric |
+| **Cyan arrows** | Direction to adjust collimation |
 | **Bottom bar** | X and Y offset with correction direction and color-coded severity |
 | **Info panel** | Full stats: offset in px/%, direction, radii, quality rating |
-| **Brightness scale** | Horizontal bar showing current brightness level with OK/dim/bright zones |
+| **Brightness bar** | Horizontal bar — current brightness level with dim/OK/bright zones |
+| **Size bar** | Vertical bar — current donut size with small/ideal/large zones |
 
 ### Quality Ratings
 
@@ -98,99 +149,58 @@ Offset percentage is relative to the outer circle radius.
 
 ## Tips for Best Results
 
-### Star Selection and Brightness
+### Star Selection
 
 - Choose a **bright, isolated star** — the script locks onto the brightest object in the frame, so avoid crowded fields or double stars.
-- **Ideal brightness:** Use SharpCap's histogram to check. The peak should land somewhere in the **middle third of the histogram** (roughly 30%-70% of the maximum value). This gives the detector plenty of contrast to work with.
-- If the histogram peak is bunched up at the far right, the star is saturated — reduce exposure or gain. If it barely rises above the left side, increase exposure or gain.
-- Brighter stars (mag 1-3) are easier to work with since they produce a strong, well-defined donut at shorter exposures.
-- The script supports both **8-bit and 16-bit** image formats. If your camera outputs 16-bit data, the overlay works automatically — no configuration needed.
+- Brighter stars (mag 1–3) produce a strong, well-defined donut at shorter exposures.
+- The script supports both **8-bit and 16-bit** image formats automatically.
 
-### Brightness Scale
+### Using SharpCap Features
 
-The overlay includes an optional **brightness scale bar** (shown above the bottom bar) that displays the current image brightness as a percentage of the sensor's maximum value. The scale has three zones:
-
-| Zone | Range | Color | Meaning |
-|------|-------|-------|---------|
-| **Too dim** | 0-26% | Red | Increase exposure or gain — weak signal produces noisy edges and unreliable detection |
-| **OK** | 26-90% | Green | Usable range — aim for the middle for best results |
-| **Too bright** | 90-100% | Red | Reduce exposure or gain — bloom and clipping cause inaccurate edge detection |
-
-A vertical marker shows the current brightness level and updates in real time as you adjust exposure or gain. The scale can be toggled on/off from the **Display** tab in the settings palette.
-
-### Defocus Amount
-
-- Defocus the star until the donut is clearly visible with a **dark center and a bright ring**. You should be able to see the secondary mirror shadow distinctly.
-- **Ideal donut size:** Aim for roughly **100-300 pixels in diameter**. The overlay info panel shows the detected outer radius — multiply by 2 for diameter.
-- Too small (under ~30px diameter) and the script can't resolve the inner/outer edges. Too large and you lose brightness and contrast.
-- A good starting point: defocus until the donut is about **1/4 to 1/3 the width of your frame**.
-
-### Using SharpCap Features to Improve Detection
-
-- **Frame stacking / live stacking:** If your donut appears noisy (especially at lower gain or with a dim star), enabling SharpCap's frame stacking can smooth out the noise and give the detector cleaner edges.
-- **Planet/disk stabilization:** If seeing conditions cause the donut to bounce around the frame, SharpCap's stabilization feature can help keep it steady, which improves tracking accuracy and reduces jitter in the overlay.
-- **ROI (Region of Interest):** Setting a smaller ROI around the star in SharpCap speeds up both capture and analysis, letting the script process frames faster.
+- **Frame stacking:** If your donut appears noisy, enabling SharpCap's frame stacking smooths out noise and gives cleaner edges.
+- **Planet/disk stabilization:** If seeing causes the donut to bounce around, stabilization keeps it steady for better tracking.
+- **ROI (Region of Interest):** A smaller ROI speeds up capture and analysis. It also increases the donut's relative frame fill, which can move you into the ideal size zone.
 
 ## Troubleshooting
 
 ### "Searching for donut..." never goes away
 
 - **No star visible**: Ensure a bright star is in the field of view and the camera is capturing.
-- **Star not defocused enough**: The star needs to show a clear donut shape with a visible dark center. A focused or slightly defocused star that appears as a bright dot will not be detected.
-- **Star too dim**: Increase exposure or gain. The peak brightness must be above 25 (on a 0-255 scale) for detection to trigger. Check the histogram — the peak should be clearly separated from the background noise.
-- **Star too small**: The donut must be at least ~30px in diameter. If it's smaller, defocus more or increase focal length/magnification.
-- **Donut fills the entire frame**: The script needs some dark background around the donut. If the bright ring extends to the frame edges, the edge detection can't find the outer boundary.
+- **Star not defocused enough**: The star needs a clear donut shape with a visible dark center.
+- **Star too dim**: Increase exposure or gain. Check the brightness bar — it should be in the green zone.
+- **Star too small**: The donut must be at least ~30px in diameter. Defocus more or check the size bar.
+- **Donut fills the entire frame**: The script needs dark background around the donut. If the ring extends to the frame edges, reduce defocus or increase the capture area.
 
-### Outer circle doesn't match the donut edge well
+### Outer circle doesn't match the donut edge
 
-- **Try a different algorithm**: Open the settings palette, go to the Detection tab, and switch between algorithms. "Edge to Dark" handles diffraction rings best; "Steepest Gradient" may work better for dim or clean images.
-- **Adjust Gradient Window**: Increase to 12-15 for heavy diffraction rings, decrease to 3-5 for clean edges.
-- **Adjust Brightness Threshold**: If the outer circle is too small, lower the threshold; if too large, raise it.
-- **Donut is not circular**: If the donut is significantly elongated (astigmatism, tilt), the circle fit will be an approximation. The script assumes circular symmetry.
+- **Try a different algorithm** — see [Choosing an Algorithm](#choosing-an-algorithm) above.
+- **Adjust Gradient Window** — increase for heavy diffraction rings, decrease for clean edges.
+- **Adjust Brightness Threshold** — lower if outer circle is too small, raise if too large.
+- **Donut is not circular** — if significantly elongated (astigmatism, tilt), the circle fit will be an approximation.
 
 ### Detection is jittery or unstable
 
-- Poor seeing or low signal-to-noise is the most common cause. Try increasing exposure or enabling stabilization.
-- If the donut is noisy, frame stacking can help smooth things out.
-- Increase the **Smoothing Factor** to 0.7-0.85 for more stable tracking (Detection tab in settings palette).
+- Increase **Smoothing Factor** to 0.7–0.85 in the Detection tab.
+- Increase exposure or enable frame stacking to improve signal-to-noise.
+- Enable SharpCap's planet/disk stabilization if seeing is poor.
 
 ### Star moves too far or overlay is lost
 
-- Click **Restart** in the settings palette, or type `restart()` in the console. This clears all tracking and re-searches for the donut.
+- Click **Restart** in the settings palette, or type `restart()` in the console.
 - Re-running the script also works — it automatically cleans up the previous instance.
-- Consider enabling SharpCap's stabilization to keep the star centered, or use a tracking mount.
-
-### Detection locks onto the wrong feature
-
-- If there are multiple bright objects in the frame, the script will find the brightest one. Center your target star and reduce the field of view or increase zoom if needed.
-- Use `restart()` or click **Restart** in the palette after repositioning.
 
 ### Overlay is slow or laggy
 
-- Set a smaller ROI in SharpCap to reduce the area the script needs to analyze.
-- Increase **Analysis Interval** to 3-5 in the Performance tab (analyze fewer frames).
-
-### Script errors on startup
-
-- Ensure you have SharpCap Pro (scripting is a Pro feature).
-- Ensure a camera is connected and live preview is running before executing the script.
-- Run `debug()` in the console for a full diagnostic dump — paste the output when reporting issues.
-
-### Toolbar button doesn't appear
-
-- The button API varies across SharpCap versions. If the button fails to create, the console will show a warning. Use `settings()` in the console instead.
-- Re-running the script automatically removes old buttons before adding new ones.
+- Set a smaller ROI in SharpCap to reduce the area analyzed.
+- Increase **Analysis Interval** to 3–5 in the Performance tab.
 
 ### Still having issues?
 
-If the troubleshooting steps above don't resolve your issue:
-
 1. Type `debug()` in the SharpCap scripting console and press Enter
-2. Wait a couple of seconds for it to complete
-3. Copy the entire output (everything between the `====` lines)
-4. Post it to the [SharpCap forum](https://forums.sharpcap.co.uk/) along with a description of what you're seeing
+2. Copy the entire output (everything between the `====` lines)
+3. Post it to the [SharpCap forum](https://forums.sharpcap.co.uk/) along with a description of what you're seeing
 
-The `debug()` output includes your script version, camera settings, detection state, a fresh analysis of the current frame (ray counts, edge spread, brightness profiles), and all configuration — everything needed to diagnose the problem remotely.
+The `debug()` output includes your script version, camera settings, detection state, a live analysis of the current frame, and all configuration — everything needed to diagnose the problem remotely.
 
 ## Console Commands
 
@@ -198,23 +208,23 @@ Type these in the SharpCap scripting console:
 
 | Command | Action |
 |---------|--------|
-| `settings()` | Open the settings palette |
+| `settings()` | Open/reopen the settings palette |
 | `restart()` | Full detection restart (same as Restart button) |
 | `reset_tracking()` | Clear tracking and re-detect the donut |
-| `debug()` | Full diagnostic dump (version, camera, detection state, live analysis, brightness profiles) |
+| `debug()` | Full diagnostic dump |
 | `debug_on()` / `debug_off()` | Toggle per-frame debug logging |
-| `stop()` | Fully stop overlay and remove toolbar button |
+| `stop()` | Fully stop the overlay |
 | `save_config()` / `load_config()` | Manually save or reload settings |
 | `reset_config()` | Reset all settings to defaults |
 
-Re-running the script automatically cleans up the previous instance (handler, buttons, settings form).
+Re-running the script automatically cleans up the previous instance.
 
 ## How It Works
 
 1. Hooks into SharpCap's `BeforeFrameDisplay` event to run on every displayed frame
 2. Gets the frame bitmap via `GetFrameBitmap()` and locks pixel data with `LockBits`
 3. Finds the donut center using a brightness-weighted centroid
-4. Casts radial rays outward from the center, detecting inner edges (dark-to-bright) and outer edges (using the selected algorithm)
+4. Casts radial rays outward from the center, detecting inner edges (dark-to-bright gradient) and outer edges (using the selected algorithm with sub-pixel interpolation)
 5. Fits circles to each set of edge points using the Kasa algebraic least-squares method
 6. Rejects outlier points and refits iteratively for higher accuracy
 7. Applies exponential smoothing across frames to stabilize the overlay

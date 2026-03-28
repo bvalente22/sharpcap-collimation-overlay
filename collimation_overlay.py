@@ -49,8 +49,8 @@
 #   1. Open SharpCap, connect camera, start live preview
 #   2. Defocus a bright star until you see a donut shape
 #   3. Tools > Scripting Console > File > Run Script > select this file
-#   4. Click "Coll Overlay" toolbar button to cycle display modes
-#   5. Click "Coll Settings" toolbar button to open the settings palette
+#   4. The settings palette opens automatically — adjust as needed
+#   5. Close the palette (X or Close button) to stop the overlay
 #
 # Requires: SharpCap Pro 4.1+ (scripting is a Pro feature)
 # =============================================================================
@@ -83,7 +83,7 @@ from System.Windows.Forms import (
     MessageBoxIcon, DialogResult, AutoScaleMode as WinFormsAutoScaleMode,
 )
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 
 # =============================================================================
 # CONFIGURATION SYSTEM
@@ -102,6 +102,7 @@ _DEFAULTS = {
     "SHOW_CORRECTION_ARROWS": True,      # Directional correction arrows + labels
     "SHOW_ALIGNMENT_CROSSHAIRS": False,  # Full-diameter crosshairs for visual alignment
     "SHOW_BRIGHTNESS_SCALE": True,       # Brightness scale bar above bottom bar
+    "SHOW_TARGET_SIZE": True,            # Vertical donut-size guide on right edge
     # Overlay colors (ARGB)
     "OUTER_CIRCLE_COLOR": (220, 255, 60, 60),      # Red - primary mirror edge
     "INNER_CIRCLE_COLOR": (220, 60, 255, 60),       # Green - secondary shadow edge
@@ -109,10 +110,10 @@ _DEFAULTS = {
     "OFFSET_LINE_COLOR":  (220, 0, 220, 255),       # Cyan - offset vector & arrows
     "TEXT_COLOR":          (240, 255, 255, 255),     # White - info panel text
     "TEXT_BG_COLOR":       (160, 0, 0, 0),           # Semi-transparent black background
-    # Line widths (pixels)
-    "CIRCLE_PEN_WIDTH":    2.0,
+    # Line widths (pixels) — kept thin for viewing at 200-300% magnification
+    "CIRCLE_PEN_WIDTH":    1.0,
     "CROSSHAIR_PEN_WIDTH": 1.0,
-    "OFFSET_PEN_WIDTH":    2.0,
+    "OFFSET_PEN_WIDTH":    1.0,
     # Crosshair size (pixels extending from center, used in modes 0-2)
     "CROSSHAIR_LENGTH": 20,
     # Text sizes (points)
@@ -281,11 +282,6 @@ try:
                 cam.BeforeFrameDisplay -= on_before_frame_display
         except:
             pass
-    for btn_name in _prev_state.get("buttons", []):
-        try:
-            SharpCap.RemoveCustomButton(btn_name)
-        except:
-            pass
     # Close settings form if open
     sf = _prev_state.get("settings_form")
     if sf is not None:
@@ -308,7 +304,6 @@ _state = {
     "handler_attached": False,
     "status": "Searching for donut...",
     "last_error": "",
-    "buttons": [],          # Toolbar button names (for cleanup)
     "ref_peak": None,       # Reference peak brightness from initial detection
     "ref_outer_r": None,    # Reference outer radius from initial detection (for ROI sizing)
     "reject_count": 0,      # Consecutive rejected detection count
@@ -447,6 +442,28 @@ def _get_brightness(pixels, offset, bpp, bpc=1):
         return float(pixels[offset])
 
 
+def _subpixel_gradient(samples, best_idx, cx, cy, cos_a, sin_a):
+    """Refine a gradient edge position to sub-pixel accuracy.
+
+    Given a ray's samples list [(dist, brightness), ...] and the index of the
+    steepest gradient, interpolate between the two neighbouring samples to find
+    the fractional distance where the brightness midpoint occurs.
+    """
+    if best_idx <= 0 or best_idx >= len(samples) - 1:
+        return float(samples[best_idx][0])
+    d_before = samples[best_idx - 1][0]
+    b_before = samples[best_idx - 1][1]
+    d_after  = samples[best_idx][0]
+    b_after  = samples[best_idx][1]
+    denom = abs(b_before - b_after)
+    if denom > 0.1:
+        # Fraction of the step where brightness crosses the midpoint
+        mid = (b_before + b_after) * 0.5
+        frac = abs(b_before - mid) / denom
+        return d_before + frac * (d_after - d_before)
+    return float(d_after)
+
+
 def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, approx_center=None, bpc=1):
     """
     Analyze raw byte pixel data (from LockBits) for a donut pattern.
@@ -557,7 +574,7 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         sin_a = math.sin(angle)
 
         # Collect all samples along the ray first
-        all_samples = []  # (dist, px, py, brightness)
+        all_samples = []  # (dist, brightness)
         for dist in range(3, max_ray_len, ray_step):
             px = int(approx_cx + cos_a * dist)
             py = int(approx_cy + sin_a * dist)
@@ -566,7 +583,7 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
                 break
 
             b = _get_brightness(raw, py * stride + px * bpp, bpp, bpc)
-            all_samples.append((dist, px, py, b))
+            all_samples.append((dist, b))
 
         if len(all_samples) < grad_window * 3:
             continue
@@ -574,16 +591,22 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         # --- Inner edge: steepest dark-to-bright gradient ---
         # Find the steepest rising gradient where the "after" side is bright.
         # This is robust to bloom flooding the central shadow with light.
+        # Use adaptive window: scale down for small images to avoid spanning
+        # the entire ring width (important for small donuts).
+        eff_gw = grad_window
+        if len(all_samples) < grad_window * 6:
+            eff_gw = max(2, grad_window // 2)
+
         best_inner_grad = 0.0
         best_inner_idx = -1
-        for j in range(grad_window, len(all_samples) - grad_window):
+        for j in range(eff_gw, len(all_samples) - eff_gw):
             avg_before = 0.0
             avg_after = 0.0
-            for k in range(grad_window):
-                avg_before += all_samples[j - 1 - k][3]
-                avg_after += all_samples[j + k][3]
-            avg_before /= grad_window
-            avg_after /= grad_window
+            for k in range(eff_gw):
+                avg_before += all_samples[j - 1 - k][1]
+                avg_after += all_samples[j + k][1]
+            avg_before /= eff_gw
+            avg_after /= eff_gw
             if avg_after > threshold and avg_after > 1.0:
                 grad = (avg_after - avg_before) / avg_after
                 if grad > best_inner_grad:
@@ -591,7 +614,10 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
                     best_inner_idx = j
 
         if best_inner_idx >= 0 and best_inner_grad > 0.3:
-            _, ipx, ipy, _ = all_samples[best_inner_idx]
+            # Sub-pixel interpolation: refine edge position between samples
+            inner_dist = _subpixel_gradient(all_samples, best_inner_idx, approx_cx, approx_cy, cos_a, sin_a)
+            ipx = approx_cx + cos_a * inner_dist
+            ipy = approx_cy + sin_a * inner_dist
             inner_points.append((ipx, ipy))
             # Build ray_samples from inner edge onward for outer detection
             ray_samples = all_samples[best_inner_idx:]
@@ -604,33 +630,53 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
         if algorithm == "threshold_crossing":
             # Simple: last point where brightness drops below threshold.
             # Fast and reliable for high-contrast donuts with clean edges.
+            # Sub-pixel: interpolate the exact crossing distance between the
+            # last above-threshold and first below-threshold samples.
             if found_inner and len(ray_samples) > 5:
                 last_crossing_idx = -1
                 was_above = False
                 for j in range(len(ray_samples)):
-                    if ray_samples[j][3] > threshold:
+                    if ray_samples[j][1] > threshold:
                         was_above = True
                     elif was_above:
                         last_crossing_idx = j
                         was_above = False
                 if last_crossing_idx >= 0:
-                    _, opx, opy, _ = ray_samples[last_crossing_idx]
+                    # Interpolate between the above-threshold and below-threshold samples
+                    b_below = ray_samples[last_crossing_idx][1]
+                    d_below = ray_samples[last_crossing_idx][0]
+                    if last_crossing_idx > 0:
+                        b_above = ray_samples[last_crossing_idx - 1][1]
+                        d_above = ray_samples[last_crossing_idx - 1][0]
+                        denom = b_above - b_below
+                        if denom > 0.1:
+                            frac = (b_above - threshold) / denom
+                            cross_dist = d_above + frac * (d_below - d_above)
+                        else:
+                            cross_dist = float(d_below)
+                    else:
+                        cross_dist = float(d_below)
+                    opx = approx_cx + cos_a * cross_dist
+                    opy = approx_cy + sin_a * cross_dist
                     outer_points.append((opx, opy))
 
         elif algorithm == "steepest_gradient":
-            # Original: steepest relative gradient drop along the ray.
-            # Good for clean donuts and dim stars without diffraction rings.
-            if found_inner and len(ray_samples) > grad_window * 2:
+            # Steepest relative gradient drop, preferring the FIRST strong
+            # edge over later diffraction-ring gradients.  Once a gradient
+            # exceeds 0.5 we accept it immediately; otherwise we keep the
+            # best one found across the whole ray (min 0.3).
+            if found_inner and len(ray_samples) > 4:
+                o_gw = max(2, min(eff_gw, len(ray_samples) // 4))
                 best_grad = 0.0
                 best_idx = -1
-                for j in range(grad_window, len(ray_samples) - grad_window):
+                for j in range(o_gw, len(ray_samples) - o_gw):
                     avg_before = 0.0
                     avg_after = 0.0
-                    for k in range(grad_window):
-                        avg_before += ray_samples[j - 1 - k][3]
-                        avg_after += ray_samples[j + k][3]
-                    avg_before /= grad_window
-                    avg_after /= grad_window
+                    for k in range(o_gw):
+                        avg_before += ray_samples[j - 1 - k][1]
+                        avg_after += ray_samples[j + k][1]
+                    avg_before /= o_gw
+                    avg_after /= o_gw
                     if avg_before > 1.0:
                         grad = (avg_before - avg_after) / avg_before
                     else:
@@ -638,24 +684,30 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
                     if grad > best_grad:
                         best_grad = grad
                         best_idx = j
+                        if grad > 0.5:
+                            break  # strong enough — accept first major drop
                 if best_idx >= 0 and best_grad > 0.3:
-                    _, opx, opy, _ = ray_samples[best_idx]
+                    outer_dist = _subpixel_gradient(ray_samples, best_idx, approx_cx, approx_cy, cos_a, sin_a)
+                    opx = approx_cx + cos_a * outer_dist
+                    opy = approx_cy + sin_a * outer_dist
                     outer_points.append((opx, opy))
 
         else:  # "edge_to_dark" (default)
-            # Steepest gradient that transitions to darkness (below threshold).
-            # Ignores dips between bright diffraction rings. Best for ring-heavy images.
-            if found_inner and len(ray_samples) > grad_window * 2:
+            # Steepest gradient that transitions to darkness (below threshold),
+            # preferring the FIRST strong edge over later diffraction-ring
+            # gradients.  Once a gradient exceeds 0.5 we accept it immediately.
+            if found_inner and len(ray_samples) > 4:
+                o_gw = max(2, min(eff_gw, len(ray_samples) // 4))
                 best_grad = 0.0
                 best_idx = -1
-                for j in range(grad_window, len(ray_samples) - grad_window):
+                for j in range(o_gw, len(ray_samples) - o_gw):
                     avg_before = 0.0
                     avg_after = 0.0
-                    for k in range(grad_window):
-                        avg_before += ray_samples[j - 1 - k][3]
-                        avg_after += ray_samples[j + k][3]
-                    avg_before /= grad_window
-                    avg_after /= grad_window
+                    for k in range(o_gw):
+                        avg_before += ray_samples[j - 1 - k][1]
+                        avg_after += ray_samples[j + k][1]
+                    avg_before /= o_gw
+                    avg_after /= o_gw
                     if avg_before > 1.0:
                         grad = (avg_before - avg_after) / avg_before
                     else:
@@ -663,8 +715,12 @@ def analyze_donut_raw(raw, stride, bpp, width, height, peak_override=None, appro
                     if grad > best_grad and avg_after < threshold:
                         best_grad = grad
                         best_idx = j
+                        if grad > 0.5:
+                            break  # strong enough — accept first major drop
                 if best_idx >= 0 and best_grad > 0.3:
-                    _, opx, opy, _ = ray_samples[best_idx]
+                    outer_dist = _subpixel_gradient(ray_samples, best_idx, approx_cx, approx_cy, cos_a, sin_a)
+                    opx = approx_cx + cos_a * outer_dist
+                    opy = approx_cy + sin_a * outer_dist
                     outer_points.append((opx, opy))
 
     # Need enough edge points from enough rays for a reliable circle fit
@@ -791,7 +847,7 @@ def analyze_donut_floats(pixels, width, height):
         sin_a = math.sin(angle)
 
         # Collect all samples along the ray first
-        all_samples = []
+        all_samples = []  # (dist, brightness)
         for dist in range(3, max_ray_len, ray_step):
             px = int(approx_cx + cos_a * dist)
             py = int(approx_cy + sin_a * dist)
@@ -800,22 +856,27 @@ def analyze_donut_floats(pixels, width, height):
                 break
 
             b = pixels[py * width + px]
-            all_samples.append((dist, px, py, b))
+            all_samples.append((dist, b))
 
         if len(all_samples) < grad_window * 3:
             continue
 
         # --- Inner edge: steepest dark-to-bright gradient ---
+        # Adaptive window for small donuts
+        eff_gw = grad_window
+        if len(all_samples) < grad_window * 6:
+            eff_gw = max(2, grad_window // 2)
+
         best_inner_grad = 0.0
         best_inner_idx = -1
-        for j in range(grad_window, len(all_samples) - grad_window):
+        for j in range(eff_gw, len(all_samples) - eff_gw):
             avg_before = 0.0
             avg_after = 0.0
-            for k in range(grad_window):
-                avg_before += all_samples[j - 1 - k][3]
-                avg_after += all_samples[j + k][3]
-            avg_before /= grad_window
-            avg_after /= grad_window
+            for k in range(eff_gw):
+                avg_before += all_samples[j - 1 - k][1]
+                avg_after += all_samples[j + k][1]
+            avg_before /= eff_gw
+            avg_after /= eff_gw
             if avg_after > threshold and avg_after > 1.0:
                 grad = (avg_after - avg_before) / avg_after
                 if grad > best_inner_grad:
@@ -823,7 +884,9 @@ def analyze_donut_floats(pixels, width, height):
                     best_inner_idx = j
 
         if best_inner_idx >= 0 and best_inner_grad > 0.3:
-            _, ipx, ipy, _ = all_samples[best_inner_idx]
+            inner_dist = _subpixel_gradient(all_samples, best_inner_idx, approx_cx, approx_cy, cos_a, sin_a)
+            ipx = approx_cx + cos_a * inner_dist
+            ipy = approx_cy + sin_a * inner_dist
             inner_points.append((ipx, ipy))
             ray_samples = all_samples[best_inner_idx:]
             found_inner = True
@@ -832,17 +895,19 @@ def analyze_donut_floats(pixels, width, height):
             found_inner = False
 
         # Find outer edge as point of steepest relative brightness decline
-        if found_inner and len(ray_samples) > grad_window * 2:
+        # Scale window to ray_samples length so search starts near inner edge
+        if found_inner and len(ray_samples) > 4:
+            o_gw = max(2, min(eff_gw, len(ray_samples) // 4))
             best_grad = 0.0
             best_idx = -1
-            for j in range(grad_window, len(ray_samples) - grad_window):
+            for j in range(o_gw, len(ray_samples) - o_gw):
                 avg_before = 0.0
                 avg_after = 0.0
-                for k in range(grad_window):
-                    avg_before += ray_samples[j - 1 - k][3]
-                    avg_after += ray_samples[j + k][3]
-                avg_before /= grad_window
-                avg_after /= grad_window
+                for k in range(o_gw):
+                    avg_before += ray_samples[j - 1 - k][1]
+                    avg_after += ray_samples[j + k][1]
+                avg_before /= o_gw
+                avg_after /= o_gw
                 if avg_before > 1.0:
                     grad = (avg_before - avg_after) / avg_before
                 else:
@@ -850,8 +915,12 @@ def analyze_donut_floats(pixels, width, height):
                 if grad > best_grad:
                     best_grad = grad
                     best_idx = j
+                    if grad > 0.5:
+                        break  # strong enough — accept first major drop
             if best_idx >= 0 and best_grad > 0.3:
-                _, opx, opy, _ = ray_samples[best_idx]
+                outer_dist = _subpixel_gradient(ray_samples, best_idx, approx_cx, approx_cy, cos_a, sin_a)
+                opx = approx_cx + cos_a * outer_dist
+                opy = approx_cy + sin_a * outer_dist
                 outer_points.append((opx, opy))
 
     if len(inner_points) < 12 or len(outer_points) < 12:
@@ -1206,6 +1275,12 @@ def draw_overlay(gfx, width, height):
     if _config["SHOW_BRIGHTNESS_SCALE"] and _state.get("brightness_pct") is not None:
         draw_brightness_scale(gfx, width, height, _state["brightness_pct"])
 
+    # --- Target size guide ---
+    if _config["SHOW_TARGET_SIZE"] and ore is not None and ore > 0:
+        max_dim = min(width, height)
+        fill_pct = ore * 2.0 / max_dim * 100.0 if max_dim > 0 else 0
+        draw_target_size(gfx, width, height, fill_pct)
+
 
 def draw_brightness_scale(gfx, width, height, pct):
     """Draw a brightness scale bar above the bottom bar showing current brightness level."""
@@ -1269,6 +1344,90 @@ def draw_brightness_scale(gfx, width, height, pct):
     if pct > 85:
         val_x = float(marker_x) - 28.0
     gfx.DrawString(val_text, font, val_brush, val_x, scale_y + 3.0)
+    val_brush.Dispose()
+    font.Dispose()
+
+
+def draw_target_size(gfx, width, height, fill_pct):
+    """Draw a vertical donut-size guide on the right edge of the frame.
+
+    Ideal donut outer-diameter is 20-60% of the shorter frame dimension.
+    Below 15% accuracy suffers from sub-pixel quantisation; above 70% the
+    outer edge risks clipping at the frame boundary.
+
+    fill_pct = outer_diameter / min(width, height) * 100
+    """
+    bar_font_size = _config["BOTTOM_BAR_FONT_SIZE"]
+    bottom_bar_h = float(bar_font_size + 16) if _config["SHOW_BOTTOM_BAR"] else 0.0
+    brightness_h = 18.0 if _config["SHOW_BRIGHTNESS_SCALE"] else 0.0
+
+    bar_w = 18.0
+    margin_top = 10.0
+    bar_x = float(width) - bar_w - 4.0
+    bar_y = margin_top
+    bar_h = float(height) - bottom_bar_h - brightness_h - margin_top - 4.0
+    if bar_h < 40:
+        return
+
+    # Background
+    bg = SolidBrush(Color.FromArgb(180, 0, 0, 0))
+    gfx.FillRectangle(bg, RectangleF(bar_x, bar_y, bar_w, bar_h))
+    bg.Dispose()
+
+    # The bar maps 0% (bottom) to 100% (top) of donut fill.
+    # Zone boundaries as fractions of bar height (measured from bottom):
+    #   0-15%  : too small (red)
+    #   15-20% : marginal small (yellow)
+    #   20-60% : ideal (green)
+    #   60-70% : marginal large (yellow)
+    #   70-100%: too large / clipping risk (red)
+    def pct_to_y(p):
+        # 0% at bottom, 100% at top
+        frac = min(1.0, max(0.0, p / 100.0))
+        return bar_y + bar_h * (1.0 - frac)
+
+    zones = [
+        (0,  15, Color.FromArgb(80, 255, 60, 60)),    # too small
+        (15, 20, Color.FromArgb(60, 255, 255, 60)),    # marginal small
+        (20, 60, Color.FromArgb(50, 60, 255, 60)),     # ideal
+        (60, 70, Color.FromArgb(60, 255, 255, 60)),    # marginal large
+        (70, 100, Color.FromArgb(80, 255, 60, 60)),    # too large
+    ]
+    for z_lo, z_hi, z_color in zones:
+        zy_top = pct_to_y(z_hi)
+        zy_bot = pct_to_y(z_lo)
+        zb = SolidBrush(z_color)
+        gfx.FillRectangle(zb, RectangleF(bar_x + 2.0, zy_top, bar_w - 4.0, zy_bot - zy_top))
+        zb.Dispose()
+
+    # Zone boundary lines
+    boundary_pen = Pen(Color.FromArgb(100, 255, 255, 255), 1.0)
+    for bp in [15, 20, 60, 70]:
+        by = pct_to_y(bp)
+        gfx.DrawLine(boundary_pen, bar_x + 2.0, by, bar_x + bar_w - 2.0, by)
+    boundary_pen.Dispose()
+
+    # Current size marker (horizontal line)
+    marker_y = pct_to_y(fill_pct)
+    marker_y = max(bar_y + 1.0, min(bar_y + bar_h - 1.0, marker_y))
+    if fill_pct < 15 or fill_pct > 70:
+        marker_color = Color.FromArgb(255, 255, 80, 80)
+    elif fill_pct < 20 or fill_pct > 60:
+        marker_color = Color.FromArgb(255, 255, 255, 80)
+    else:
+        marker_color = Color.FromArgb(255, 0, 255, 0)
+    marker_pen = Pen(marker_color, 2.0)
+    gfx.DrawLine(marker_pen, bar_x + 1.0, marker_y, bar_x + bar_w - 1.0, marker_y)
+    marker_pen.Dispose()
+
+    # Percentage label
+    font = Font(FontFamily.GenericMonospace, 8.0, FontStyle.Regular)
+    val_brush = SolidBrush(marker_color)
+    val_text = "%d%%" % int(fill_pct)
+    val_y = marker_y - 12.0
+    if fill_pct > 90:
+        val_y = marker_y + 3.0
+    gfx.DrawString(val_text, font, val_brush, bar_x - 30.0, val_y)
     val_brush.Dispose()
     font.Dispose()
 
@@ -1830,7 +1989,9 @@ def debug():
                     info.append("  No donut detected in this frame")
                 else:
                     info.append("  Algorithm: %s" % _config.get("DETECTION_ALGORITHM", "threshold_crossing"))
-                    info.append("  Grad window: %d" % _config.get("GRAD_WINDOW", 10))
+                    gw = _config.get("GRAD_WINDOW", 10)
+                    # Effective window adapts for small donuts (same logic as analyze_donut_raw)
+                    info.append("  Grad window: %d (sub-pixel interpolation: on)" % gw)
                     info.append("  Peak brightness: %.1f" % result["peak"])
                     info.append("  Threshold: %.1f (%.0f%% of peak)" % (
                         result["threshold"], result["threshold"] / result["peak"] * 100 if result["peak"] > 0 else 0))
@@ -2408,6 +2569,7 @@ _SETTINGS_META = [
     ("SHOW_BOTTOM_BAR",           "Bottom Numerical Details",   "Display", "bool", None, None, None),
     ("SHOW_CORRECTION_ARROWS",    "Correction Arrows",          "Display", "bool", None, None, None),
     ("SHOW_BRIGHTNESS_SCALE",     "Target Brightness",          "Display", "bool", None, None, None),
+    ("SHOW_TARGET_SIZE",          "Target Size",                "Display", "bool", None, None, None),
     # --- Appearance tab ---
     ("OUTER_CIRCLE_COLOR",    "Outer Circle Color",    "Colors", "color", None, None, None),
     ("INNER_CIRCLE_COLOR",    "Inner Circle Color",    "Colors", "color", None, None, None),
@@ -2477,30 +2639,44 @@ def _build_settings_form():
     bottom.Height = 36
     bottom.Dock = DockStyle.Bottom
 
+    btn_w = 54
+    btn_gap = 4
+    total_btns_w = btn_w * 4 + btn_gap * 3
+    btn_x = (form.Width - total_btns_w) // 2
+
     btn_reset = Button()
     btn_reset.Text = "Reset"
-    btn_reset.Width = 60
+    btn_reset.Width = btn_w
     btn_reset.Height = 24
-    btn_reset.Left = 6
+    btn_reset.Left = btn_x
     btn_reset.Top = 5
 
     btn_restart = Button()
     btn_restart.Text = "Restart"
-    btn_restart.Width = 60
+    btn_restart.Width = btn_w
     btn_restart.Height = 24
-    btn_restart.Left = (form.Width - 60) // 2
+    btn_restart.Left = btn_x + btn_w + btn_gap
     btn_restart.Top = 5
 
     btn_save = Button()
     btn_save.Text = "Save"
-    btn_save.Width = 60
+    btn_save.Width = btn_w
     btn_save.Height = 24
-    btn_save.Left = form.Width - 82
+    btn_save.Left = btn_x + (btn_w + btn_gap) * 2
     btn_save.Top = 5
+
+    btn_close = Button()
+    btn_close.Text = "Close"
+    btn_close.Width = btn_w
+    btn_close.Height = 24
+    btn_close.Left = btn_x + (btn_w + btn_gap) * 3
+    btn_close.Top = 5
+    btn_close.ForeColor = Color.FromArgb(255, 180, 40, 40)
 
     bottom.Controls.Add(btn_reset)
     bottom.Controls.Add(btn_restart)
     bottom.Controls.Add(btn_save)
+    bottom.Controls.Add(btn_close)
 
     form.Controls.Add(tabs)
     form.Controls.Add(bottom)
@@ -2578,14 +2754,14 @@ def _build_settings_form():
     alg_tip_lbl = Label()
     alg_tip_lbl.Left = 4
     alg_tip_lbl.Top = det_y
-    alg_tip_lbl.Width = 240
-    alg_tip_lbl.Height = 36
+    alg_tip_lbl.Width = form.Width - 24
+    alg_tip_lbl.Height = 46
     alg_tip_lbl.ForeColor = Color.FromArgb(255, 100, 100, 100)
     tip_font = Font(alg_tip_lbl.Font.FontFamily, 7.5, FontStyle.Italic)
     alg_tip_lbl.Font = tip_font
     alg_tip_lbl.Text = _algo_tips.get(cur_algo, "")
     det_tp.Controls.Add(alg_tip_lbl)
-    det_y += 40
+    det_y += 50
 
     # Separator line
     sep = Label()
@@ -2791,9 +2967,17 @@ def _build_settings_form():
     def on_save(sender, e):
         save_config()
 
+    def on_close(sender, e):
+        detach_handler()
+        _state["enabled"] = False
+        _state["settings_form"] = None
+        form.Close()
+        print("[Collimation] Stopped. Run the script again to restart.")
+
     btn_reset.Click += on_reset
     btn_restart.Click += on_restart
     btn_save.Click += on_save
+    btn_close.Click += on_close
 
     return form
 
@@ -2812,7 +2996,12 @@ def open_settings():
     form = _build_settings_form()
 
     def on_closed(sender, e):
+        # Closing the palette (X button or Close button) stops the overlay
         _state["settings_form"] = None
+        if _state["enabled"]:
+            detach_handler()
+            _state["enabled"] = False
+            print("[Collimation] Stopped. Run the script again to restart.")
 
     form.FormClosed += on_closed
     _state["settings_form"] = form
@@ -2827,70 +3016,6 @@ def settings():
 # =============================================================================
 # SETUP AND TEARDOWN
 # =============================================================================
-
-def _make_icon(icon_type):
-    """Create a 24x24 toolbar icon bitmap using GDI+ drawing."""
-    size = 24
-    bmp = Bitmap(size, size)
-    g = System.Drawing.Graphics.FromImage(bmp)
-    g.Clear(Color.Transparent)
-
-    if icon_type == "toggle":
-        p = Pen(Color.FromArgb(255, 220, 60, 60), 2.0)
-        g.DrawEllipse(p, 2, 2, 19, 19)
-        p.Dispose()
-        p = Pen(Color.FromArgb(255, 60, 220, 60), 2.0)
-        g.DrawEllipse(p, 7, 7, 9, 9)
-        p.Dispose()
-        b = SolidBrush(Color.Yellow)
-        g.FillRectangle(b, RectangleF(10.0, 10.0, 3.0, 3.0))
-        b.Dispose()
-
-    elif icon_type == "settings":
-        # Wrench/gear icon
-        p = Pen(Color.FromArgb(255, 200, 200, 200), 2.0)
-        # Outer gear ring
-        g.DrawEllipse(p, 4, 4, 15, 15)
-        p.Dispose()
-        # Inner dot
-        b = SolidBrush(Color.FromArgb(255, 200, 200, 200))
-        g.FillRectangle(b, RectangleF(9.0, 9.0, 5.0, 5.0))
-        b.Dispose()
-        # Gear teeth (4 lines crossing the circle)
-        p = Pen(Color.FromArgb(255, 200, 200, 200), 2.0)
-        g.DrawLine(p, 11.0, 1.0, 11.0, 5.0)   # top
-        g.DrawLine(p, 11.0, 18.0, 11.0, 22.0)  # bottom
-        g.DrawLine(p, 1.0, 11.0, 5.0, 11.0)    # left
-        g.DrawLine(p, 18.0, 11.0, 22.0, 11.0)  # right
-        p.Dispose()
-
-    elif icon_type == "reset":
-        p = Pen(Color.FromArgb(255, 100, 180, 255), 2.0)
-        g.DrawArc(p, 4, 4, 15, 15, 0, 270)
-        p.Dispose()
-        p = Pen(Color.FromArgb(255, 100, 180, 255), 2.0)
-        g.DrawLine(p, 11.0, 4.0, 19.0, 4.0)
-        g.DrawLine(p, 19.0, 4.0, 19.0, 10.0)
-        p.Dispose()
-
-    g.Dispose()
-    return bmp
-
-
-def _add_toolbar_button(btn_name, icon, tooltip, callback):
-    """Try to add a toolbar button using the 3 known arg orderings."""
-    for arg_order in [
-        (btn_name, icon, tooltip, callback),
-        (btn_name, callback, icon, tooltip),
-        (btn_name, callback, tooltip, icon),
-    ]:
-        try:
-            SharpCap.AddCustomButton(*arg_order)
-            return True
-        except:
-            pass
-    return False
-
 
 def attach_handler():
     """Register the overlay event handler on the selected camera."""
@@ -2945,15 +3070,8 @@ def restart():
 
 
 def stop():
-    """Fully stop the overlay: detach handler, remove toolbar button, disable."""
+    """Fully stop the overlay: detach handler, close settings, disable."""
     detach_handler()
-    for btn_name in _state.get("buttons", []):
-        try:
-            SharpCap.RemoveCustomButton(btn_name)
-            print("[Collimation] Removed button: %s" % btn_name)
-        except:
-            pass
-    _state["buttons"] = []
     _state["enabled"] = False
     sf = _state.get("settings_form")
     if sf is not None:
@@ -2969,37 +3087,27 @@ def stop():
 def setup():
     """
     Initialize the collimation overlay:
-      1. Add toolbar buttons (Overlay + Settings)
-      2. Attach the BeforeFrameDisplay handler to the camera
+      1. Attach the BeforeFrameDisplay handler to the camera
+      2. Open the settings palette
       3. Print usage instructions to the console
+    Closing the settings palette stops the overlay.
     """
     print("=" * 50)
     print("  COLLIMATION OVERLAY v%s" % VERSION)
     print("=" * 50)
 
-    buttons = []
-
-    # Settings button
-    btn_settings = "Coll Settings"
-    icon_settings = _make_icon("settings")
-    if _add_toolbar_button(btn_settings, icon_settings, "Open collimation settings", open_settings):
-        buttons.append(btn_settings)
-        print("[OK] Toolbar button: '%s'" % btn_settings)
-    else:
-        print("[WARN] Could not add settings button")
-        print("  Use settings() in console")
-
-    _state["buttons"] = buttons
-
     attach_handler()
+    open_settings()
 
     print("")
     print("Console commands:")
-    print("  settings()             - open settings dialog")
+    print("  settings()             - open/reopen settings dialog")
     print("  reset_tracking()       - re-detect donut")
     print("  debug()                - full diagnostic dump")
     print("  debug_on() / debug_off() - per-frame logging")
-    print("  stop()                 - fully stop + remove button")
+    print("  stop()                 - fully stop overlay")
+    print("")
+    print("Close the settings palette to stop the overlay.")
     print("=" * 50)
 
 
@@ -3007,7 +3115,8 @@ def setup():
 # AUTO-START
 # =============================================================================
 # When this script is executed (via File > Run Script or exec()), setup()
-# runs automatically, registering the handler and creating the toolbar buttons.
+# runs automatically, registering the handler and opening the settings palette.
 # The script then exits, but the handler remains active on every frame.
+# Close the settings palette to stop the overlay.
 
 setup()

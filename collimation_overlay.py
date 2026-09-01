@@ -83,7 +83,7 @@ from System.Windows.Forms import (
     MessageBoxIcon, DialogResult, AutoScaleMode as WinFormsAutoScaleMode,
 )
 
-VERSION = "2.0.3"
+VERSION = "2.0.4"
 
 # =============================================================================
 # CONFIGURATION SYSTEM
@@ -103,6 +103,23 @@ _DEFAULTS = {
     "SHOW_ALIGNMENT_CROSSHAIRS": False,  # Full-diameter crosshairs for visual alignment
     "SHOW_BRIGHTNESS_SCALE": True,       # Brightness scale bar above bottom bar
     "SHOW_TARGET_SIZE": True,            # Vertical donut-size guide on right edge
+    # Display-zoom compensation
+    # The overlay is drawn in IMAGE pixel coordinates, so SharpCap's display
+    # zoom magnifies it along with the frame: at 200% zoom the text is drawn
+    # twice as large on screen. When enabled, screen furniture (text, panels,
+    # bars, arrows, markers) is divided by the zoom factor so it keeps a
+    # constant on-screen size. Circle/donut geometry is never scaled -- it
+    # must stay locked to the image pixels.
+    "SCALE_OVERLAY_WITH_ZOOM": True,
+    "MANUAL_ZOOM": 0.0,                  # 0 = auto-detect; else fixed factor (1.0 = 100%, 2.0 = 200%)
+    # Legibility floor for zoom compensation. The overlay is rasterized at
+    # image resolution, so at high zoom exact compensation would render text
+    # at 2-3pt and then magnify the mush. Scaling stops once the info panel
+    # font reaches this size, after which the overlay does grow on screen.
+    # 0 disables the floor. See MIN_FONT_SIZE notes in the README.
+    "MIN_FONT_SIZE": 6,
+    # Settings palette scaling (0 = auto from monitor DPI, 1.5 = 150%, ...)
+    "UI_SCALE": 0.0,
     # Overlay colors (ARGB)
     "OUTER_CIRCLE_COLOR": (220, 255, 60, 60),      # Red - primary mirror edge
     "INNER_CIRCLE_COLOR": (220, 60, 255, 60),       # Green - secondary shadow edge
@@ -145,7 +162,8 @@ _COLOR_KEYS = frozenset(k for k in _DEFAULTS if k.endswith("_COLOR"))
 
 # Float keys (non-integer numeric)
 _FLOAT_KEYS = frozenset(["CIRCLE_PEN_WIDTH", "CROSSHAIR_PEN_WIDTH", "OFFSET_PEN_WIDTH",
-                          "ROI_MARGIN_FACTOR", "SMOOTHING_FACTOR"])
+                          "ROI_MARGIN_FACTOR", "SMOOTHING_FACTOR",
+                          "MANUAL_ZOOM", "UI_SCALE"])
 
 # Bool keys (on/off toggles)
 _BOOL_KEYS = frozenset(k for k in _DEFAULTS if isinstance(_DEFAULTS[k], bool))
@@ -312,6 +330,10 @@ _state = {
     "settings_form": None,  # Reference to open SettingsForm
     "restart_blanking": 0,  # Frames remaining to show blank overlay after restart
     "brightness_pct": None,  # Current brightness as % of max (0-100), None if unknown
+    "zoom": None,           # Last detected display zoom factor (1.0 = 100%), None if unknown
+    "zoom_path": None,      # SharpCap property path zoom was read from ("" = none found)
+    "zoom_probe_frame": -1,  # Frame number of the last re-probe attempt
+    "draw_scale": 1.0,      # Screen-furniture scale factor applied by the drawing code
 }
 
 
@@ -1116,11 +1138,409 @@ def _try_cut_roi(frame):
 
 
 # =============================================================================
+# DISPLAY ZOOM COMPENSATION
+# =============================================================================
+# Overlays are drawn into the frame in IMAGE pixel coordinates, then SharpCap
+# scales the whole frame to the display zoom level. So a 10pt label drawn at
+# 200% zoom appears twice as big on screen as it does at 100%.
+#
+# There is no documented scripting property for the display zoom and the name
+# differs between SharpCap builds, so we probe a list of likely property paths
+# once and cache whichever one works. If none is found the overlay simply
+# isn't scaled (same behaviour as before) and MANUAL_ZOOM can be set instead.
+
+# SharpCap.ZoomPercent is the live display zoom (4.1+, verified: 200.0 at 200%).
+# Note SharpCap.Settings.DefaultZoomValue is the *startup* default, not the
+# current zoom, so it is deliberately not in this list.
+_ZOOM_PATHS = [
+    "ZoomPercent",
+    "Display.ZoomPercent", "MainWindow.ZoomPercent", "SelectedCamera.ZoomPercent",
+    "Display.ZoomLevel", "Display.Zoom", "Display.ZoomFactor", "Display.Magnification",
+    "Zoom", "ZoomLevel", "ZoomFactor",
+    "Settings.Zoom", "Settings.ZoomLevel", "Settings.DisplayZoom",
+    "Transforms.Zoom",
+    "SelectedCamera.Zoom", "SelectedCamera.ZoomLevel",
+    "SelectedCamera.Display.Zoom", "SelectedCamera.Display.ZoomLevel",
+    "MainWindow.Zoom", "MainWindow.ZoomLevel",
+]
+
+
+def _path_is_percent(path):
+    """True if a property name says its value is a percentage."""
+    low = (path or "").lower()
+    return "percent" in low or low.endswith("pct")
+
+# How often (in frames) to retry probing when no zoom property has been found.
+# Only failed lookups back off like this -- once a property is found it is read
+# fresh every frame. restart() / rescan_zoom() clears the backoff immediately.
+_ZOOM_REPROBE_INTERVAL = 300
+
+
+def _clamp_zoom(z):
+    """Keep a zoom factor inside a sane range."""
+    if z is None or z <= 0:
+        return None
+    return min(16.0, max(0.05, float(z)))
+
+
+def _normalize_zoom(val, as_percent=False):
+    """Coerce a SharpCap zoom property value into a float factor (1.0 = 100%).
+
+    Accepts numbers (2.0 or 200), strings ("200%", "2x", "1:2", "Fit") and
+    enum values (via str()). Returns None if it can't be interpreted.
+
+    `as_percent` forces percentage interpretation, which the magnitude
+    heuristic below can't do on its own: ZoomPercent = 12.5 means 12.5%, but
+    a bare 12.5 from an unnamed property would mean 12.5x.
+    """
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        if isinstance(val, (int, float)):
+            z = float(val)
+        else:
+            txt = str(val).strip().lower()
+            if not txt or "fit" in txt or "auto" in txt:
+                return None
+            txt = txt.replace("zoom", "").replace("percent", "").strip()
+            if ":" in txt:
+                # "1:2" (half size) / "2:1" (double size)
+                a, b = txt.split(":", 1)
+                a = float("".join(c for c in a if c.isdigit() or c == "."))
+                b = float("".join(c for c in b if c.isdigit() or c == "."))
+                return None if b == 0 else _clamp_zoom(a / b)
+            is_pct = "%" in txt
+            digits = "".join(c for c in txt if c.isdigit() or c == ".")
+            if not digits.strip("."):
+                return None
+            z = float(digits)
+            if is_pct:
+                return _clamp_zoom(z / 100.0)
+    except Exception:
+        return None
+    if z <= 0:
+        return None
+    # Values above 20 are almost certainly percentages (200 -> 2.0)
+    if as_percent or z > 20.0:
+        z = z / 100.0
+    return _clamp_zoom(z)
+
+
+def _read_path(root, path):
+    """Resolve a dotted attribute path, returning None if any step is missing."""
+    obj = root
+    for part in path.split("."):
+        obj = getattr(obj, part)
+        if obj is None:
+            return None
+    return obj
+
+
+def get_display_zoom(rescan=False):
+    """Return the current SharpCap display zoom factor (1.0 = 100%), or None.
+
+    MANUAL_ZOOM overrides auto-detection when it is non-zero.
+    """
+    manual = float(_config.get("MANUAL_ZOOM") or 0.0)
+    if manual > 0:
+        _state["zoom"] = _clamp_zoom(manual)
+        _state["zoom_path"] = "MANUAL_ZOOM"
+        return _state["zoom"]
+
+    if rescan:
+        _state["zoom_path"] = None
+
+    path = _state.get("zoom_path")
+
+    # Fast path: we already know which property works
+    if path and path != "MANUAL_ZOOM":
+        try:
+            z = _normalize_zoom(_read_path(SharpCap, path), _path_is_percent(path))
+            if z is not None:
+                _state["zoom"] = z
+                return z
+        except Exception:
+            pass
+        _state["zoom_path"] = None  # property vanished - re-probe below
+
+    # Known-bad: don't hammer failing lookups on every frame
+    if _state.get("zoom_path") == "":
+        fc = _state.get("frame_count", 0)
+        if fc - _state.get("zoom_probe_frame", -1) < _ZOOM_REPROBE_INTERVAL:
+            return _state.get("zoom")
+    _state["zoom_probe_frame"] = _state.get("frame_count", 0)
+
+    for candidate in _ZOOM_PATHS:
+        try:
+            z = _normalize_zoom(_read_path(SharpCap, candidate), _path_is_percent(candidate))
+        except Exception:
+            continue
+        if z is not None:
+            _state["zoom_path"] = candidate
+            _state["zoom"] = z
+            return z
+
+    _state["zoom_path"] = ""
+    _state["zoom"] = None
+    return None
+
+
+def _min_draw_scale():
+    """Smallest scale allowed before text stops being legible.
+
+    Derived from MIN_FONT_SIZE against the info panel font, so the floor is
+    expressed in the same units as the font settings. Never above 1.0 - the
+    floor may only stop the overlay shrinking, never make it bigger than the
+    sizes configured for 100% zoom.
+    """
+    min_font = float(_config.get("MIN_FONT_SIZE") or 0.0)
+    if min_font <= 0:
+        return 0.0
+    base = float(_config.get("TEXT_FONT_SIZE") or 0.0)
+    if base <= 0:
+        return 0.0
+    return min(1.0, min_font / base)
+
+
+def _update_draw_scale():
+    """Recompute the screen-furniture scale factor for this frame."""
+    scale = 1.0
+    if _config.get("SCALE_OVERLAY_WITH_ZOOM"):
+        try:
+            z = get_display_zoom()
+        except Exception:
+            z = None
+        if z and z > 0:
+            # Inverse of the zoom: at 200% zoom draw everything half size so
+            # it ends up the same on-screen size as at 100%.
+            scale = min(4.0, max(0.2, 1.0 / z))
+            # ...but not so small that the text stops being readable.
+            scale = max(scale, _min_draw_scale())
+    _state["draw_scale"] = scale
+    return scale
+
+
+def _bottom_bar_height():
+    """Height of the bottom readout bar in image pixels (0 if hidden)."""
+    if not _config["SHOW_BOTTOM_BAR"]:
+        return 0.0
+    return _dfont(_config["BOTTOM_BAR_FONT_SIZE"]) + _ds(16.0)
+
+
+def _brightness_scale_height():
+    """Height of the brightness scale bar in image pixels (0 if hidden)."""
+    return _ds(18.0) if _config["SHOW_BRIGHTNESS_SCALE"] else 0.0
+
+
+def _ds(value):
+    """Scale a screen-space dimension (px) by the current draw scale."""
+    return float(value) * _state.get("draw_scale", 1.0)
+
+
+def _dfont(size):
+    """Scale a font size, holding it at MIN_FONT_SIZE once the floor is hit.
+
+    Fonts smaller than the info panel font (the bar and arrow labels) would
+    still fall under the floor at high zoom, so each one is clamped here too -
+    never above its own unscaled size, so 100% zoom is untouched.
+    """
+    size = float(size)
+    floor = min(size, float(_config.get("MIN_FONT_SIZE") or 0.0))
+    return max(3.0, floor, size * _state.get("draw_scale", 1.0))
+
+
+def rescan_zoom():
+    """Forget the cached zoom lookup so the next frame probes again.
+
+    Called by restart() / the Restart button and whenever a zoom-related
+    setting changes, so a failed lookup never has to wait out the backoff.
+    """
+    _state["zoom_path"] = None
+    _state["zoom_probe_frame"] = -1
+
+
+def zoom(rescan=True):
+    """Print the detected display zoom and how the overlay is being scaled."""
+    z = get_display_zoom(rescan=rescan)
+    path = _state.get("zoom_path")
+    print("[Collimation] Display zoom: %s" % ("%.0f%%" % (z * 100.0) if z else "unknown"))
+    if path == "MANUAL_ZOOM":
+        print("  Source: MANUAL_ZOOM setting (%.2f)" % float(_config.get("MANUAL_ZOOM") or 0))
+    elif path:
+        print("  Source: SharpCap.%s" % path)
+    else:
+        print("  Source: not found - no zoom property on this SharpCap build.")
+        print("  Set MANUAL_ZOOM (Appearance tab) to match your display zoom,")
+        print("  or run find_zoom() to look for the property name.")
+    print("  Scale overlays with zoom: %s" % bool(_config.get("SCALE_OVERLAY_WITH_ZOOM")))
+    scale = _update_draw_scale()
+    floor = _min_draw_scale()
+    print("  Current overlay scale: %.2fx" % scale)
+    if floor > 0:
+        print("  Legibility floor: %.2fx (MIN_FONT_SIZE %s vs panel font %s)%s"
+              % (floor, _config.get("MIN_FONT_SIZE"), _config.get("TEXT_FONT_SIZE"),
+                 " - ACTIVE, overlay is larger than at 100%" if z and 1.0 / z < floor else ""))
+    return z
+
+
+def set_zoom(factor):
+    """Set MANUAL_ZOOM from the console: set_zoom(2.0) for a 200% display zoom.
+
+    set_zoom(0) returns to auto-detection. This is the reliable fix when
+    auto-detection reports "unknown" - press Save in the palette afterwards to
+    keep it across sessions.
+    """
+    try:
+        f = float(factor)
+    except Exception:
+        print("[Collimation] set_zoom() needs a number, e.g. set_zoom(2.0)")
+        return
+    _config["MANUAL_ZOOM"] = max(0.0, f)
+    rescan_zoom()
+    sf = _state.get("settings_form")
+    if sf is not None:
+        try:
+            sf.Invalidate()
+        except Exception:
+            pass
+    if f <= 0:
+        print("[Collimation] Manual zoom cleared - back to auto-detection.")
+    else:
+        print("[Collimation] Manual zoom = %.2f (%.0f%%), overlay scale %.2fx"
+              % (f, f * 100.0, _update_draw_scale()))
+    print("  (the palette's Manual Zoom box updates when it is reopened;")
+    print("   press Save there to persist this)")
+
+
+def find_zoom():
+    """Dump everything that could carry the display zoom, for diagnosis.
+
+    Prints (1) any zoom-like member on the SharpCap objects, (2) the full
+    member list of SharpCap and its main sub-objects, and (3) the transform
+    state of the annotation Graphics from one live frame. Paste the output
+    into an issue so the lookup list can be extended for your build.
+    """
+    print("")
+    print("=" * 60)
+    print("  ZOOM PROPERTY SEARCH")
+    print("=" * 60)
+
+    roots = [("SharpCap", SharpCap)]
+    for name in ("Display", "Settings", "Transforms", "SelectedCamera", "MainWindow"):
+        try:
+            obj = getattr(SharpCap, name)
+            if obj is not None:
+                roots.append(("SharpCap.%s" % name, obj))
+        except Exception:
+            pass
+
+    print("")
+    print("--- Zoom-like members ---")
+    hits = 0
+    for root_name, root in roots:
+        try:
+            members = [m for m in dir(root) if not m.startswith("_")]
+        except Exception:
+            continue
+        for m in members:
+            low = m.lower()
+            if "zoom" in low or "magnif" in low or "scale" in low or "fit" in low:
+                try:
+                    val = getattr(root, m)
+                except Exception as ex:
+                    val = "(unreadable: %s)" % ex
+                print("  %s.%s = %r  -> %s"
+                      % (root_name, m, val, _normalize_zoom(val, _path_is_percent(m))))
+                hits += 1
+    if hits == 0:
+        print("  (none)")
+
+    print("")
+    print("--- Available members ---")
+    for root_name, root in roots:
+        try:
+            members = [m for m in dir(root) if not m.startswith("_")]
+        except Exception:
+            continue
+        print("  %s: %s" % (root_name, members))
+
+    # --- annotation Graphics state from one live frame ---
+    print("")
+    print("--- Annotation Graphics (capturing one frame...) ---")
+    cam = None
+    try:
+        cam = SharpCap.SelectedCamera
+    except Exception:
+        pass
+    if cam is None:
+        print("  SKIPPED (no camera)")
+    else:
+        _gd = {"done": False, "info": []}
+
+        def gfx_handler(*args):
+            if _gd["done"]:
+                return
+            _gd["done"] = True
+            info = _gd["info"]
+            g = None
+            db = None
+            try:
+                frame = args[1].Frame
+                try:
+                    g = frame.GetAnnotationGraphics("collimation")
+                except Exception:
+                    db = frame.GetDrawableBitmap()
+                    g = db.GetGraphics() if db is not None else None
+                if g is None:
+                    info.append("  (no graphics context)")
+                    return
+                for prop in ("PageScale", "PageUnit", "DpiX", "DpiY",
+                             "Transform", "ClipBounds", "VisibleClipBounds",
+                             "CompositingMode", "InterpolationMode"):
+                    try:
+                        info.append("  %s = %s" % (prop, getattr(g, prop)))
+                    except Exception as ex:
+                        info.append("  %s: (%s)" % (prop, ex))
+                info.append("  members: %s" % [x for x in dir(g) if not x.startswith("_")])
+            except Exception as ex:
+                info.append("  FAILED: %s" % ex)
+            finally:
+                for obj in (g, db):
+                    try:
+                        if obj is not None:
+                            obj.Dispose()
+                    except Exception:
+                        pass
+
+        try:
+            cam.BeforeFrameDisplay += gfx_handler
+            time.sleep(2)
+            cam.BeforeFrameDisplay -= gfx_handler
+        except Exception as ex:
+            print("  FAILED to attach handler: %s" % ex)
+        if _gd["info"]:
+            for line in _gd["info"]:
+                print(line)
+        else:
+            print("  No frames received (is the preview running?)")
+
+    print("")
+    print("=" * 60)
+    print("If nothing above yields the zoom, use set_zoom(2.0) (or the")
+    print("Manual Zoom box in the palette) to set it by hand.")
+    print("=" * 60)
+
+
+# =============================================================================
 # OVERLAY DRAWING
 # =============================================================================
 
 def draw_overlay(gfx, width, height):
     """Main overlay drawing function. Respects overlay toggle settings."""
+    # Screen furniture (text, panels, bars, arrows) is sized in image pixels
+    # but displayed at the current zoom, so compensate for it once per frame.
+    _update_draw_scale()
+
     try:
         gfx.SmoothingMode = SmoothingMode.AntiAlias
     except:
@@ -1151,13 +1571,13 @@ def draw_overlay(gfx, width, height):
 
         # Small center crosshairs (tied to circles)
         pen = Pen(_config["CROSSHAIR_COLOR"], _config["CROSSHAIR_PEN_WIDTH"])
-        ch = float(_config["CROSSHAIR_LENGTH"])
+        ch = _ds(_config["CROSSHAIR_LENGTH"])
         gfx.DrawLine(pen, float(ocx - ch), float(ocy), float(ocx + ch), float(ocy))
         gfx.DrawLine(pen, float(ocx), float(ocy - ch), float(ocx), float(ocy + ch))
         pen.Dispose()
 
         pen = Pen(_config["INNER_CIRCLE_COLOR"], _config["CROSSHAIR_PEN_WIDTH"])
-        ch2 = float(_config["CROSSHAIR_LENGTH"] * 0.6)
+        ch2 = _ds(_config["CROSSHAIR_LENGTH"] * 0.6)
         gfx.DrawLine(pen, float(icx - ch2), float(icy), float(icx + ch2), float(icy))
         gfx.DrawLine(pen, float(icx), float(icy - ch2), float(icx), float(icy + ch2))
         pen.Dispose()
@@ -1176,7 +1596,7 @@ def draw_overlay(gfx, width, height):
             pen.Dispose()
 
             if offset_dist > 3:
-                arrow_len = min(12.0, offset_dist * 0.4)
+                arrow_len = min(_ds(12.0), offset_dist * 0.4)
                 angle = math.atan2(dy, dx)
                 a1 = angle + math.pi * 0.8
                 a2 = angle - math.pi * 0.8
@@ -1210,16 +1630,19 @@ def draw_overlay(gfx, width, height):
     # --- Correction arrows ---
     if _config["SHOW_CORRECTION_ARROWS"]:
         min_arrow_threshold = 1.5
-        arrow_gap = 15.0
-        arrow_shaft = 30.0
-        arrow_head = 10.0
-        arrow_pen_w = 2.5
+        arrow_gap = _ds(15.0)
+        arrow_shaft = _ds(30.0)
+        arrow_head = _ds(10.0)
+        arrow_pen_w = max(1.0, _ds(2.5))
+        arrow_font_size = _dfont(_config["ARROW_LABEL_FONT_SIZE"])
+        label_drop = _ds(16.0)
+        label_nudge = _ds(5.0)
         corr_x = -dx
         corr_y = -dy
 
         if abs(corr_x) > min_arrow_threshold:
             ax_sign = 1.0 if corr_x > 0 else -1.0
-            ax_y = float(ocy - ore - arrow_gap - 8)
+            ax_y = float(ocy - ore - arrow_gap - _ds(8.0))
             ax_start = float(ocx)
             ax_end = float(ocx + ax_sign * arrow_shaft)
 
@@ -1231,18 +1654,20 @@ def draw_overlay(gfx, width, height):
                 float(ax_end - ax_sign * arrow_head * 0.7), float(ax_y + arrow_head * 0.5))
             pen.Dispose()
 
-            font = Font(FontFamily.GenericMonospace, _config["ARROW_LABEL_FONT_SIZE"], FontStyle.Bold)
+            font = Font(FontFamily.GenericMonospace, arrow_font_size, FontStyle.Bold)
             brush = SolidBrush(_config["OFFSET_LINE_COLOR"])
             if corr_x > 0:
-                gfx.DrawString("MOVE X >>>", font, brush, float(ocx + 5), float(ax_y - 16))
+                gfx.DrawString("MOVE X >>>", font, brush,
+                    float(ocx + label_nudge), float(ax_y - label_drop))
             else:
-                gfx.DrawString("<<< MOVE X", font, brush, float(ocx - arrow_shaft - 20), float(ax_y - 16))
+                gfx.DrawString("<<< MOVE X", font, brush,
+                    float(ocx - arrow_shaft - _ds(20.0)), float(ax_y - label_drop))
             font.Dispose()
             brush.Dispose()
 
         if abs(corr_y) > min_arrow_threshold:
             ay_sign = 1.0 if corr_y > 0 else -1.0
-            ay_x = float(ocx + ore + arrow_gap + 8)
+            ay_x = float(ocx + ore + arrow_gap + _ds(8.0))
             ay_start = float(ocy)
             ay_end = float(ocy + ay_sign * arrow_shaft)
 
@@ -1254,12 +1679,14 @@ def draw_overlay(gfx, width, height):
                 float(ay_x + arrow_head * 0.5), float(ay_end - ay_sign * arrow_head * 0.7))
             pen.Dispose()
 
-            font = Font(FontFamily.GenericMonospace, _config["ARROW_LABEL_FONT_SIZE"], FontStyle.Bold)
+            font = Font(FontFamily.GenericMonospace, arrow_font_size, FontStyle.Bold)
             brush = SolidBrush(_config["OFFSET_LINE_COLOR"])
             if corr_y < 0:
-                gfx.DrawString("MOVE Y UP", font, brush, float(ay_x + 5), float(ocy - arrow_shaft - 5))
+                gfx.DrawString("MOVE Y UP", font, brush,
+                    float(ay_x + label_nudge), float(ocy - arrow_shaft - label_nudge))
             else:
-                gfx.DrawString("MOVE Y DN", font, brush, float(ay_x + 5), float(ocy + arrow_shaft - 5))
+                gfx.DrawString("MOVE Y DN", font, brush,
+                    float(ay_x + label_nudge), float(ocy + arrow_shaft - label_nudge))
             font.Dispose()
             brush.Dispose()
 
@@ -1284,15 +1711,16 @@ def draw_overlay(gfx, width, height):
 
 def draw_brightness_scale(gfx, width, height, pct):
     """Draw a brightness scale bar above the bottom bar showing current brightness level."""
-    bar_font_size = _config["BOTTOM_BAR_FONT_SIZE"]
-    bottom_bar_h = float(bar_font_size + 16) if _config["SHOW_BOTTOM_BAR"] else 0.0
-    scale_h = 18.0
+    bottom_bar_h = _bottom_bar_height()
+    scale_h = _ds(18.0)
     scale_y = float(height) - bottom_bar_h - scale_h
     margin = float(width) * 0.05
     scale_x = margin
     scale_w = float(width) - margin * 2.0
     bar_x = scale_x
     bar_w = scale_w
+
+    inset = _ds(2.0)
 
     # Background
     bg = SolidBrush(Color.FromArgb(180, 0, 0, 0))
@@ -1302,27 +1730,27 @@ def draw_brightness_scale(gfx, width, height, pct):
     # "Too dim" zone (0-26%) - red
     dim_w = bar_w * 0.26
     dim_brush = SolidBrush(Color.FromArgb(80, 255, 60, 60))
-    gfx.FillRectangle(dim_brush, RectangleF(bar_x, scale_y + 2.0, float(dim_w), scale_h - 4.0))
+    gfx.FillRectangle(dim_brush, RectangleF(bar_x, scale_y + inset, float(dim_w), scale_h - inset * 2.0))
     dim_brush.Dispose()
 
     # "OK" zone (26-90%) - green
     ok_x = bar_x + dim_w
     ok_w = bar_w * 0.64
     ok_brush = SolidBrush(Color.FromArgb(50, 60, 255, 60))
-    gfx.FillRectangle(ok_brush, RectangleF(float(ok_x), scale_y + 2.0, float(ok_w), scale_h - 4.0))
+    gfx.FillRectangle(ok_brush, RectangleF(float(ok_x), scale_y + inset, float(ok_w), scale_h - inset * 2.0))
     ok_brush.Dispose()
 
     # "Too bright" zone (90-100%) - red
     bright_x = bar_x + dim_w + ok_w
     bright_w = bar_w * 0.10
     bright_brush = SolidBrush(Color.FromArgb(80, 255, 60, 60))
-    gfx.FillRectangle(bright_brush, RectangleF(float(bright_x), scale_y + 2.0, float(bright_w), scale_h - 4.0))
+    gfx.FillRectangle(bright_brush, RectangleF(float(bright_x), scale_y + inset, float(bright_w), scale_h - inset * 2.0))
     bright_brush.Dispose()
 
     # Zone boundary lines
     boundary_pen = Pen(Color.FromArgb(100, 255, 255, 255), 1.0)
-    gfx.DrawLine(boundary_pen, float(ok_x), scale_y + 2.0, float(ok_x), scale_y + scale_h - 2.0)
-    gfx.DrawLine(boundary_pen, float(bright_x), scale_y + 2.0, float(bright_x), scale_y + scale_h - 2.0)
+    gfx.DrawLine(boundary_pen, float(ok_x), scale_y + inset, float(ok_x), scale_y + scale_h - inset)
+    gfx.DrawLine(boundary_pen, float(bright_x), scale_y + inset, float(bright_x), scale_y + scale_h - inset)
     boundary_pen.Dispose()
 
     # Current brightness marker (vertical line)
@@ -1331,19 +1759,19 @@ def draw_brightness_scale(gfx, width, height, pct):
         marker_color = Color.FromArgb(255, 255, 80, 80)
     else:
         marker_color = Color.FromArgb(255, 0, 255, 0)
-    marker_pen = Pen(marker_color, 2.0)
-    gfx.DrawLine(marker_pen, float(marker_x), scale_y + 1.0, float(marker_x), scale_y + scale_h - 1.0)
+    marker_pen = Pen(marker_color, max(1.0, _ds(2.0)))
+    gfx.DrawLine(marker_pen, float(marker_x), scale_y + inset * 0.5, float(marker_x), scale_y + scale_h - inset * 0.5)
     marker_pen.Dispose()
 
     # Show percentage next to marker
-    font = Font(FontFamily.GenericMonospace, 8.0, FontStyle.Regular)
+    font = Font(FontFamily.GenericMonospace, _dfont(8.0), FontStyle.Regular)
     val_text = "%d%%" % int(pct)
     val_brush = SolidBrush(marker_color)
-    val_x = float(marker_x) + 4.0
+    val_x = float(marker_x) + _ds(4.0)
     # Flip to left side if near right edge
     if pct > 85:
-        val_x = float(marker_x) - 28.0
-    gfx.DrawString(val_text, font, val_brush, val_x, scale_y + 3.0)
+        val_x = float(marker_x) - _ds(28.0)
+    gfx.DrawString(val_text, font, val_brush, val_x, scale_y + _ds(3.0))
     val_brush.Dispose()
     font.Dispose()
 
@@ -1357,15 +1785,15 @@ def draw_target_size(gfx, width, height, fill_pct):
 
     fill_pct = outer_diameter / min(width, height) * 100
     """
-    bar_font_size = _config["BOTTOM_BAR_FONT_SIZE"]
-    bottom_bar_h = float(bar_font_size + 16) if _config["SHOW_BOTTOM_BAR"] else 0.0
-    brightness_h = 18.0 if _config["SHOW_BRIGHTNESS_SCALE"] else 0.0
+    bottom_bar_h = _bottom_bar_height()
+    brightness_h = _brightness_scale_height()
 
-    bar_w = 18.0
-    margin_top = 10.0
-    bar_x = float(width) - bar_w - 4.0
+    bar_w = _ds(18.0)
+    inset = _ds(2.0)
+    margin_top = _ds(10.0)
+    bar_x = float(width) - bar_w - _ds(4.0)
     bar_y = margin_top
-    bar_h = float(height) - bottom_bar_h - brightness_h - margin_top - 4.0
+    bar_h = float(height) - bottom_bar_h - brightness_h - margin_top - _ds(4.0)
     if bar_h < 40:
         return
 
@@ -1397,44 +1825,45 @@ def draw_target_size(gfx, width, height, fill_pct):
         zy_top = pct_to_y(z_hi)
         zy_bot = pct_to_y(z_lo)
         zb = SolidBrush(z_color)
-        gfx.FillRectangle(zb, RectangleF(bar_x + 2.0, zy_top, bar_w - 4.0, zy_bot - zy_top))
+        gfx.FillRectangle(zb, RectangleF(bar_x + inset, zy_top, bar_w - inset * 2.0, zy_bot - zy_top))
         zb.Dispose()
 
     # Zone boundary lines
     boundary_pen = Pen(Color.FromArgb(100, 255, 255, 255), 1.0)
     for bp in [15, 20, 60, 70]:
         by = pct_to_y(bp)
-        gfx.DrawLine(boundary_pen, bar_x + 2.0, by, bar_x + bar_w - 2.0, by)
+        gfx.DrawLine(boundary_pen, bar_x + inset, by, bar_x + bar_w - inset, by)
     boundary_pen.Dispose()
 
     # Current size marker (horizontal line)
     marker_y = pct_to_y(fill_pct)
-    marker_y = max(bar_y + 1.0, min(bar_y + bar_h - 1.0, marker_y))
+    marker_y = max(bar_y + inset * 0.5, min(bar_y + bar_h - inset * 0.5, marker_y))
     if fill_pct < 15 or fill_pct > 70:
         marker_color = Color.FromArgb(255, 255, 80, 80)
     elif fill_pct < 20 or fill_pct > 60:
         marker_color = Color.FromArgb(255, 255, 255, 80)
     else:
         marker_color = Color.FromArgb(255, 0, 255, 0)
-    marker_pen = Pen(marker_color, 2.0)
-    gfx.DrawLine(marker_pen, bar_x + 1.0, marker_y, bar_x + bar_w - 1.0, marker_y)
+    marker_pen = Pen(marker_color, max(1.0, _ds(2.0)))
+    gfx.DrawLine(marker_pen, bar_x + inset * 0.5, marker_y, bar_x + bar_w - inset * 0.5, marker_y)
     marker_pen.Dispose()
 
     # Percentage label
-    font = Font(FontFamily.GenericMonospace, 8.0, FontStyle.Regular)
+    font = Font(FontFamily.GenericMonospace, _dfont(8.0), FontStyle.Regular)
     val_brush = SolidBrush(marker_color)
     val_text = "%d%%" % int(fill_pct)
-    val_y = marker_y - 12.0
+    val_y = marker_y - _ds(12.0)
     if fill_pct > 90:
-        val_y = marker_y + 3.0
-    gfx.DrawString(val_text, font, val_brush, bar_x - 30.0, val_y)
+        val_y = marker_y + _ds(3.0)
+    gfx.DrawString(val_text, font, val_brush, bar_x - _ds(30.0), val_y)
     val_brush.Dispose()
     font.Dispose()
 
 
 def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
     """Draw the X/Y offset readout bar at the bottom of the frame."""
-    bar_h = float(_config["BOTTOM_BAR_FONT_SIZE"] + 16)
+    bar_font_size = _dfont(_config["BOTTOM_BAR_FONT_SIZE"])
+    bar_h = _bottom_bar_height()
     bar_y = float(height) - bar_h
     offset_pct = (offset_dist / ore * 100.0) if ore > 0 else 0.0
 
@@ -1442,8 +1871,8 @@ def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
     gfx.FillRectangle(bg, RectangleF(0.0, bar_y, float(width), bar_h))
     bg.Dispose()
 
-    font_lg = Font(FontFamily.GenericMonospace, _config["BOTTOM_BAR_FONT_SIZE"], FontStyle.Bold)
-    font_sm = Font(FontFamily.GenericMonospace, _config["BOTTOM_BAR_FONT_SIZE"] - 2.0, FontStyle.Regular)
+    font_lg = Font(FontFamily.GenericMonospace, bar_font_size, FontStyle.Bold)
+    font_sm = Font(FontFamily.GenericMonospace, max(3.0, bar_font_size - _ds(2.0)), FontStyle.Regular)
 
     def offset_color(val):
         pct = abs(val) / ore * 100.0 if ore > 0 else 0
@@ -1464,7 +1893,7 @@ def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
     if abs(dx) < 1.5:
         x_corr = "OK"
     x_text = "X: %+.1f px  %s" % (-dx, x_corr)
-    gfx.DrawString(x_text, font_lg, x_brush, float(width * 0.1), bar_y + 6.0)
+    gfx.DrawString(x_text, font_lg, x_brush, float(width * 0.1), bar_y + _ds(6.0))
     x_brush.Dispose()
 
     y_color = offset_color(dy)
@@ -1473,13 +1902,13 @@ def draw_bottom_bar(gfx, width, height, dx, dy, offset_dist, ore):
     if abs(dy) < 1.5:
         y_corr = "OK"
     y_text = "Y: %+.1f px  %s" % (dy, y_corr)
-    gfx.DrawString(y_text, font_lg, y_brush, float(width * 0.45), bar_y + 6.0)
+    gfx.DrawString(y_text, font_lg, y_brush, float(width * 0.45), bar_y + _ds(6.0))
     y_brush.Dispose()
 
     tot_color = offset_color(offset_dist)
     tot_brush = SolidBrush(tot_color)
     tot_text = "Total: %.1f px (%.1f%%)" % (offset_dist, offset_pct)
-    gfx.DrawString(tot_text, font_sm, tot_brush, float(width * 0.75), bar_y + 9.0)
+    gfx.DrawString(tot_text, font_sm, tot_brush, float(width * 0.75), bar_y + _ds(9.0))
     tot_brush.Dispose()
 
     font_lg.Dispose()
@@ -1526,26 +1955,27 @@ def draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist
         "Quality: %s" % quality,
     ]
 
-    txt_font_size = _config["TEXT_FONT_SIZE"]
+    txt_font_size = _dfont(_config["TEXT_FONT_SIZE"])
     font = Font(FontFamily.GenericMonospace, txt_font_size, FontStyle.Regular)
     txt_brush = SolidBrush(_config["TEXT_COLOR"])
     bg_brush = SolidBrush(_config["TEXT_BG_COLOR"])
     q_brush = SolidBrush(qcolor)
 
-    pad = 6
-    line_h = txt_font_size + 4
+    pad = _ds(6.0)
+    line_h = txt_font_size + _ds(4.0)
     panel_w = float(txt_font_size * 22)
     panel_h = float(len(lines) * line_h + pad * 2)
 
-    gfx.FillRectangle(bg_brush, RectangleF(float(pad), float(pad), panel_w, panel_h))
+    gfx.FillRectangle(bg_brush, RectangleF(pad, pad, panel_w, panel_h))
 
-    y = float(pad + 4)
+    text_x = pad + _ds(6.0)
+    y = pad + _ds(4.0)
     for i, line in enumerate(lines):
         if i == 6:
-            gfx.DrawString("Quality: ", font, txt_brush, float(pad + 6), y)
-            gfx.DrawString("         %s" % quality, font, q_brush, float(pad + 6), y)
+            gfx.DrawString("Quality: ", font, txt_brush, text_x, y)
+            gfx.DrawString("         %s" % quality, font, q_brush, text_x, y)
         else:
-            gfx.DrawString(line, font, txt_brush, float(pad + 6), y)
+            gfx.DrawString(line, font, txt_brush, text_x, y)
         y += line_h
 
     font.Dispose()
@@ -1556,14 +1986,14 @@ def draw_info_panel(gfx, width, height, ocx, ocy, ore, icx, icy, ir, offset_dist
 
 def draw_status_text(gfx, text):
     """Draw a status message (e.g., 'Searching for donut...') at top-left."""
-    txt_font_size = _config["TEXT_FONT_SIZE"]
+    txt_font_size = _dfont(_config["TEXT_FONT_SIZE"])
     font = Font(FontFamily.GenericMonospace, txt_font_size, FontStyle.Bold)
     brush = SolidBrush(Color.Orange)
     bg = SolidBrush(_config["TEXT_BG_COLOR"])
-    w = float(len(text) * (txt_font_size * 0.65) + 16)
-    h = float(txt_font_size + 10)
-    gfx.FillRectangle(bg, RectangleF(6.0, 6.0, w, h))
-    gfx.DrawString(text, font, brush, 10.0, 8.0)
+    w = float(len(text) * (txt_font_size * 0.65) + _ds(16.0))
+    h = float(txt_font_size + _ds(10.0))
+    gfx.FillRectangle(bg, RectangleF(_ds(6.0), _ds(6.0), w, h))
+    gfx.DrawString(text, font, brush, _ds(10.0), _ds(8.0))
     font.Dispose()
     brush.Dispose()
     bg.Dispose()
@@ -1571,11 +2001,11 @@ def draw_status_text(gfx, text):
 
 def draw_error_text(gfx, text):
     """Draw an error message at top-left (red text on dark background)."""
-    font = Font(FontFamily.GenericMonospace, 10.0, FontStyle.Regular)
+    font = Font(FontFamily.GenericMonospace, _dfont(10.0), FontStyle.Regular)
     brush = SolidBrush(Color.Red)
     bg = SolidBrush(_config["TEXT_BG_COLOR"])
-    gfx.FillRectangle(bg, RectangleF(10.0, 10.0, 500.0, 20.0))
-    gfx.DrawString(text, font, brush, 14.0, 12.0)
+    gfx.FillRectangle(bg, RectangleF(_ds(10.0), _ds(10.0), _ds(500.0), _ds(20.0)))
+    gfx.DrawString(text, font, brush, _ds(14.0), _ds(12.0))
     font.Dispose()
     brush.Dispose()
     bg.Dispose()
@@ -1830,6 +2260,33 @@ def debug():
     print("  ref_outer_r: %s" % _state.get("ref_outer_r"))
     print("  reject_count: %d" % _state.get("reject_count", 0))
     print("  last_error: %s" % _state["last_error"])
+
+    # -- Display scaling --
+    print("")
+    print("--- Display Scaling ---")
+    try:
+        z = get_display_zoom(rescan=True)
+        src = _state.get("zoom_path")
+        print("  zoom: %s" % ("%.0f%%" % (z * 100.0) if z else "unknown"))
+        print("  zoom source: %s" % (("SharpCap.%s" % src) if src else "(none found)"))
+        print("  scale overlays with zoom: %s" % bool(_config.get("SCALE_OVERLAY_WITH_ZOOM")))
+        print("  overlay draw scale: %.2fx" % _update_draw_scale())
+    except Exception as ex:
+        print("  (unable to read zoom: %s)" % ex)
+    try:
+        from System.Windows.Forms import Screen
+        b = Screen.PrimaryScreen.Bounds
+        print("  primary screen: %dx%d" % (b.Width, b.Height))
+    except Exception:
+        pass
+    sf = _state.get("settings_form")
+    if sf is not None:
+        try:
+            g = sf.CreateGraphics()
+            print("  palette DPI: %.0f (%.2fx)" % (g.DpiX, g.DpiX / 96.0))
+            g.Dispose()
+        except Exception:
+            pass
 
     # -- Config (non-default values highlighted) --
     print("")
@@ -2570,6 +3027,7 @@ _SETTINGS_META = [
     ("SHOW_CORRECTION_ARROWS",    "Correction Arrows",          "Display", "bool", None, None, None),
     ("SHOW_BRIGHTNESS_SCALE",     "Target Brightness",          "Display", "bool", None, None, None),
     ("SHOW_TARGET_SIZE",          "Target Size",                "Display", "bool", None, None, None),
+    ("SCALE_OVERLAY_WITH_ZOOM",   "Scale Overlay to Zoom",      "Display", "bool", None, None, None),
     # --- Appearance tab ---
     ("OUTER_CIRCLE_COLOR",    "Outer Circle Color",    "Colors", "color", None, None, None),
     ("INNER_CIRCLE_COLOR",    "Inner Circle Color",    "Colors", "color", None, None, None),
@@ -2584,6 +3042,9 @@ _SETTINGS_META = [
     ("TEXT_FONT_SIZE",         "Info Panel Font Size",  "Colors", "int",   6, 24, 1),
     ("BOTTOM_BAR_FONT_SIZE",  "Bottom Bar Font Size",  "Colors", "int",   6, 24, 1),
     ("ARROW_LABEL_FONT_SIZE", "Arrow Label Font Size", "Colors", "int",   6, 24, 1),
+    ("MIN_FONT_SIZE",         "Min Font Size (zoom)",  "Colors", "int",   0, 16, 1),
+    ("MANUAL_ZOOM",           "Manual Zoom (0=auto)",  "Colors", "float", 0.0, 8.0, 0.25),
+    ("UI_SCALE",              "Palette Scale (0=auto)", "Colors", "float", 0.0, 3.0, 0.25),
     # --- Detection tab ---
     # (Algorithm selector is added manually at top of Detection tab)
     ("GRAD_WINDOW",                 "Gradient Window (px)",    "Detection", "int",   3, 30, 1),
@@ -2602,22 +3063,89 @@ _SETTINGS_META = [
 ]
 
 
+def _get_ui_metrics(form):
+    """Return (layout_scale, font_scale) for the settings palette.
+
+    The palette is laid out with explicit pixel coordinates, which only look
+    right at 96 DPI. `layout_scale` multiplies every coordinate; `font_scale`
+    multiplies point sizes on top of the scaling GDI+ already applies for the
+    monitor DPI, so total magnification is `layout_scale` in both cases.
+
+    Auto mode uses the monitor DPI. A 4K screen running at 100% Windows
+    scaling reports 96 DPI but has tiny controls, so a modest boost is applied
+    by screen width. UI_SCALE overrides all of it (1.5 = 150%).
+    """
+    dpi = 96.0
+    try:
+        # Desktop DC - reads the DPI without forcing the form handle to exist
+        from System import IntPtr
+        g = System.Drawing.Graphics.FromHwnd(IntPtr.Zero)
+        dpi = float(g.DpiX)
+        g.Dispose()
+    except Exception:
+        try:
+            g = form.CreateGraphics()
+            dpi = float(g.DpiX)
+            g.Dispose()
+        except Exception:
+            pass
+    dpi_scale = max(1.0, dpi / 96.0)
+
+    manual = float(_config.get("UI_SCALE") or 0.0)
+    if manual > 0:
+        total = min(4.0, max(0.5, manual))
+    else:
+        boost = 1.0
+        if dpi_scale < 1.05:
+            # DPI scaling is off - fall back to a screen-width heuristic
+            try:
+                from System.Windows.Forms import Screen
+                sw = Screen.PrimaryScreen.Bounds.Width
+                if sw >= 3000:
+                    boost = 1.5
+                elif sw >= 2400:
+                    boost = 1.25
+            except Exception:
+                pass
+        total = dpi_scale * boost
+
+    return total, max(0.5, total / dpi_scale)
+
+
 def _build_settings_form():
     """Create and return the settings Form with all controls."""
     form = Form()
     form.Text = "Live Collimation Aid"
-    form.Width = 270
-    form.Height = 400
+
+    # All coordinates below are authored for a 96 DPI / 1080p screen and are
+    # scaled through S() so the palette stays usable on 4K and high-DPI setups.
+    ui_scale, font_scale = _get_ui_metrics(form)
+
+    def S(v):
+        return int(round(v * ui_scale))
+
+    # We do our own scaling, so keep WinForms from adding another layer on top.
+    try:
+        # ("None" is a Python keyword, so it has to be fetched by name)
+        form.AutoScaleMode = getattr(WinFormsAutoScaleMode, "None")
+    except:
+        pass
+    if abs(font_scale - 1.0) > 0.01:
+        try:
+            base_font = form.Font
+            form.Font = Font(base_font.FontFamily,
+                             base_font.SizeInPoints * font_scale,
+                             base_font.Style)
+        except:
+            pass
+
+    form.Width = S(270)
+    form.Height = S(400)
     form.FormBorderStyle = FormBorderStyle.FixedToolWindow
     form.MaximizeBox = False
     form.MinimizeBox = False
     form.StartPosition = FormStartPosition.CenterScreen
     form.TopMost = True
-    try:
-        form.AutoScaleMode = WinFormsAutoScaleMode.Font
-        form.AutoScaleDimensions = System.Drawing.SizeF(6.0, 13.0)
-    except:
-        pass
 
     # Tab control
     tabs = TabControl()
@@ -2630,47 +3158,47 @@ def _build_settings_form():
         tp = TabPage()
         tp.Text = tab_name
         tp.AutoScroll = True
-        tp.Padding = Padding(4, 4, 4, 4)
+        tp.Padding = Padding(S(4), S(4), S(4), S(4))
         tab_pages[tab_name] = tp
         tabs.TabPages.Add(tp)
 
     # Bottom panel with buttons
     bottom = Panel()
-    bottom.Height = 36
+    bottom.Height = S(36)
     bottom.Dock = DockStyle.Bottom
 
-    btn_w = 54
-    btn_gap = 4
+    btn_w = S(54)
+    btn_gap = S(4)
     total_btns_w = btn_w * 4 + btn_gap * 3
     btn_x = (form.Width - total_btns_w) // 2
 
     btn_reset = Button()
     btn_reset.Text = "Reset"
     btn_reset.Width = btn_w
-    btn_reset.Height = 24
+    btn_reset.Height = S(24)
     btn_reset.Left = btn_x
-    btn_reset.Top = 5
+    btn_reset.Top = S(5)
 
     btn_restart = Button()
     btn_restart.Text = "Restart"
     btn_restart.Width = btn_w
-    btn_restart.Height = 24
+    btn_restart.Height = S(24)
     btn_restart.Left = btn_x + btn_w + btn_gap
-    btn_restart.Top = 5
+    btn_restart.Top = S(5)
 
     btn_save = Button()
     btn_save.Text = "Save"
     btn_save.Width = btn_w
-    btn_save.Height = 24
+    btn_save.Height = S(24)
     btn_save.Left = btn_x + (btn_w + btn_gap) * 2
-    btn_save.Top = 5
+    btn_save.Top = S(5)
 
     btn_close = Button()
     btn_close.Text = "Close"
     btn_close.Width = btn_w
-    btn_close.Height = 24
+    btn_close.Height = S(24)
     btn_close.Left = btn_x + (btn_w + btn_gap) * 3
-    btn_close.Top = 5
+    btn_close.Top = S(5)
     btn_close.ForeColor = Color.FromArgb(255, 180, 40, 40)
 
     bottom.Controls.Add(btn_reset)
@@ -2686,23 +3214,23 @@ def _build_settings_form():
 
     # Layout: stack controls vertically per tab
     tab_y = {}  # current y position per tab
-    lbl_w = 120  # label width
-    ctrl_left = 125  # control x position
+    lbl_w = S(120)  # label width
+    ctrl_left = S(125)  # control x position
 
     # Master enable/disable checkbox at top of Display tab
     display_controls = []  # track Display tab controls to enable/disable
 
     cb_enable = CheckBox()
     cb_enable.Text = "Enable Overlay"
-    cb_enable.Left = 4
-    cb_enable.Top = 4
-    cb_enable.Width = 220
-    cb_enable.Height = 22
+    cb_enable.Left = S(4)
+    cb_enable.Top = S(4)
+    cb_enable.Width = S(220)
+    cb_enable.Height = S(22)
     cb_enable.Checked = _state["enabled"]
     font_bold = Font(cb_enable.Font, FontStyle.Bold)
     cb_enable.Font = font_bold
     tab_pages["Display"].Controls.Add(cb_enable)
-    tab_y["Display"] = 32
+    tab_y["Display"] = S(32)
 
     def on_enable_change(sender, e):
         _state["enabled"] = sender.Checked
@@ -2723,14 +3251,14 @@ def _build_settings_form():
     _algo_tips = {a[0]: a[2] for a in _ALGORITHMS}
 
     det_tp = tab_pages["Detection"]
-    det_y = tab_y.get("Detection", 4)
+    det_y = tab_y.get("Detection", S(4))
 
     alg_lbl = Label()
     alg_lbl.Text = "Algorithm"
-    alg_lbl.Left = 4
-    alg_lbl.Top = det_y + 3
+    alg_lbl.Left = S(4)
+    alg_lbl.Top = det_y + S(3)
     alg_lbl.Width = lbl_w
-    alg_lbl.Height = 18
+    alg_lbl.Height = S(18)
     font_bold_det = Font(alg_lbl.Font, FontStyle.Bold)
     alg_lbl.Font = font_bold_det
     det_tp.Controls.Add(alg_lbl)
@@ -2738,8 +3266,8 @@ def _build_settings_form():
     alg_combo = ComboBox()
     alg_combo.Left = ctrl_left
     alg_combo.Top = det_y
-    alg_combo.Width = 120
-    alg_combo.Height = 22
+    alg_combo.Width = S(120)
+    alg_combo.Height = S(22)
     alg_combo.DropDownStyle = ComboBoxStyle.DropDownList
     for lbl_text in _algo_labels:
         alg_combo.Items.Add(lbl_text)
@@ -2749,29 +3277,29 @@ def _build_settings_form():
     else:
         alg_combo.SelectedIndex = 0
     det_tp.Controls.Add(alg_combo)
-    det_y += 26
+    det_y += S(26)
 
     alg_tip_lbl = Label()
-    alg_tip_lbl.Left = 4
+    alg_tip_lbl.Left = S(4)
     alg_tip_lbl.Top = det_y
-    alg_tip_lbl.Width = form.Width - 24
-    alg_tip_lbl.Height = 46
+    alg_tip_lbl.Width = form.Width - S(24)
+    alg_tip_lbl.Height = S(46)
     alg_tip_lbl.ForeColor = Color.FromArgb(255, 100, 100, 100)
-    tip_font = Font(alg_tip_lbl.Font.FontFamily, 7.5, FontStyle.Italic)
+    tip_font = Font(alg_tip_lbl.Font.FontFamily, 7.5 * font_scale, FontStyle.Italic)
     alg_tip_lbl.Font = tip_font
     alg_tip_lbl.Text = _algo_tips.get(cur_algo, "")
     det_tp.Controls.Add(alg_tip_lbl)
-    det_y += 50
+    det_y += S(50)
 
     # Separator line
     sep = Label()
-    sep.Left = 4
+    sep.Left = S(4)
     sep.Top = det_y
-    sep.Width = 240
-    sep.Height = 2
+    sep.Width = S(240)
+    sep.Height = S(2)
     sep.BorderStyle = System.Windows.Forms.BorderStyle.Fixed3D
     det_tp.Controls.Add(sep)
-    det_y += 8
+    det_y += S(8)
 
     def on_algo_change(sender, e):
         idx = sender.SelectedIndex
@@ -2796,14 +3324,14 @@ def _build_settings_form():
 
     for key, label_text, tab_name, ctrl_type, c_min, c_max, c_step in _SETTINGS_META:
         tp = tab_pages[tab_name]
-        y = tab_y.get(tab_name, 4)
+        y = tab_y.get(tab_name, S(4))
 
         lbl = Label()
         lbl.Text = label_text
-        lbl.Left = 4
-        lbl.Top = y + 3
+        lbl.Left = S(4)
+        lbl.Top = y + S(3)
         lbl.Width = lbl_w
-        lbl.Height = 18
+        lbl.Height = S(18)
         tp.Controls.Add(lbl)
 
         if ctrl_type == "bool":
@@ -2814,10 +3342,10 @@ def _build_settings_form():
                 from System.Windows.Forms import RadioButton
                 rb = RadioButton()
                 rb.Text = label_text
-                rb.Left = 4
+                rb.Left = S(4)
                 rb.Top = y
-                rb.Width = 220
-                rb.Height = 22
+                rb.Width = S(220)
+                rb.Height = S(22)
                 rb.Checked = bool(_config[key])
                 tp.Controls.Add(rb)
 
@@ -2839,20 +3367,22 @@ def _build_settings_form():
                 if tab_name == "Display":
                     rb.Enabled = _state["enabled"]
                     display_controls.append(rb)
-                tab_y[tab_name] = y + 24
+                tab_y[tab_name] = y + S(24)
             else:
                 cb = CheckBox()
                 cb.Text = label_text
-                cb.Left = 4
+                cb.Left = S(4)
                 cb.Top = y
-                cb.Width = 220
-                cb.Height = 22
+                cb.Width = S(220)
+                cb.Height = S(22)
                 cb.Checked = bool(_config[key])
                 tp.Controls.Add(cb)
 
                 def make_bool_change(k):
                     def on_change(sender, e):
                         _config[k] = sender.Checked
+                        if k == "SCALE_OVERLAY_WITH_ZOOM" and sender.Checked:
+                            rescan_zoom()
                     return on_change
                 cb.CheckedChanged += make_bool_change(key)
 
@@ -2860,7 +3390,7 @@ def _build_settings_form():
                 if tab_name == "Display":
                     cb.Enabled = _state["enabled"]
                     display_controls.append(cb)
-                tab_y[tab_name] = y + 24
+                tab_y[tab_name] = y + S(24)
 
         elif ctrl_type == "color":
             color_val = _config[key]
@@ -2868,8 +3398,8 @@ def _build_settings_form():
             pnl = Panel()
             pnl.Left = ctrl_left
             pnl.Top = y
-            pnl.Width = 90
-            pnl.Height = 20
+            pnl.Width = S(90)
+            pnl.Height = S(20)
             pnl.BackColor = Color.FromArgb(255, color_val.R, color_val.G, color_val.B)
             pnl.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle
             tp.Controls.Add(pnl)
@@ -2888,14 +3418,14 @@ def _build_settings_form():
             pnl.Click += make_color_click(key, pnl)
 
             control_map[key] = (pnl, None, None)
-            tab_y[tab_name] = y + 24
+            tab_y[tab_name] = y + S(24)
 
         elif ctrl_type == "float":
             nud = NumericUpDown()
             nud.Left = ctrl_left
             nud.Top = y
-            nud.Width = 65
-            nud.Height = 22
+            nud.Width = S(65)
+            nud.Height = S(22)
             nud.DecimalPlaces = 2
             nud.Minimum = System.Decimal(c_min)
             nud.Maximum = System.Decimal(c_max)
@@ -2906,18 +3436,24 @@ def _build_settings_form():
             def make_float_change(k):
                 def on_change(sender, e):
                     _config[k] = float(sender.Value)
+                    if k == "UI_SCALE":
+                        print("[Collimation] Palette scale set to %s - Save, then "
+                              "re-run the script to apply."
+                              % ("auto" if _config[k] <= 0 else "%.2fx" % _config[k]))
+                    elif k == "MANUAL_ZOOM":
+                        rescan_zoom()
                 return on_change
             nud.ValueChanged += make_float_change(key)
 
             control_map[key] = (nud, None, None)
-            tab_y[tab_name] = y + 26
+            tab_y[tab_name] = y + S(26)
 
         elif ctrl_type == "int":
             nud = NumericUpDown()
             nud.Left = ctrl_left
             nud.Top = y
-            nud.Width = 65
-            nud.Height = 22
+            nud.Width = S(65)
+            nud.Height = S(22)
             nud.DecimalPlaces = 0
             nud.Minimum = System.Decimal(c_min)
             nud.Maximum = System.Decimal(c_max)
@@ -2932,7 +3468,7 @@ def _build_settings_form():
             nud.ValueChanged += make_int_change(key)
 
             control_map[key] = (nud, None, None)
-            tab_y[tab_name] = y + 26
+            tab_y[tab_name] = y + S(26)
 
     # --- Button handlers ---
     def on_reset(sender, e):
@@ -3065,6 +3601,7 @@ def restart():
     _state["last_error"] = ""
     _state["enabled"] = True
     _state["restart_blanking"] = 15  # Show blank "Restarting..." for ~15 frames
+    rescan_zoom()  # frame_count reset above also resets the re-probe backoff
     attach_handler()
     print("[Collimation] Restarted - searching for donut...")
 
@@ -3102,6 +3639,9 @@ def setup():
     print("")
     print("Console commands:")
     print("  settings()             - open/reopen settings dialog")
+    print("  zoom()                 - show detected display zoom + overlay scale")
+    print("  set_zoom(2.0)          - set the zoom by hand if detection fails")
+    print("  find_zoom()            - hunt for the zoom property on this build")
     print("  reset_tracking()       - re-detect donut")
     print("  debug()                - full diagnostic dump")
     print("  debug_on() / debug_off() - per-frame logging")

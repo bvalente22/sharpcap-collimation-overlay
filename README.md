@@ -91,12 +91,20 @@ The settings palette opens automatically when the script runs. You can also reop
 - **Correction Arrows** — directional arrows showing which way to adjust
 - **Target Brightness** — horizontal brightness level indicator
 - **Target Size** — vertical donut size indicator
+- **Scale Overlay to Zoom** — keep text, panels, bars and arrows the same
+  on-screen size at any display zoom (default on, see below)
 
 ### Colors Tab
 
 - Color pickers for all overlay elements
 - Line widths for circles, crosshairs, and offset lines (default 1.0px — suitable for viewing at 200–300% zoom)
 - Font sizes for info panel, bottom bar, and arrow labels
+- **Min Font Size (zoom)** — legibility floor for zoom compensation
+  (default 6, 0 = no floor, see below)
+- **Manual Zoom** — display zoom factor used for overlay scaling when
+  auto-detection fails (0 = auto, 2.0 = 200%)
+- **Palette Scale** — size of the settings palette itself (0 = auto from
+  monitor DPI, 1.5 = 150%). Takes effect after Save + re-running the script.
 
 ### Detection Tab
 
@@ -116,7 +124,7 @@ The settings palette opens automatically when the script runs. You can also reop
 | Button | Action |
 |--------|--------|
 | **Reset** | Reset all settings to defaults |
-| **Restart** | Full detection restart — clears tracking and re-searches for the donut |
+| **Restart** | Full detection restart — clears tracking, re-searches for the donut, and re-scans for the display zoom |
 | **Save** | Save settings to `collimation_settings.cfg` (persists across sessions) |
 | **Close** | Stop the overlay and close the palette |
 
@@ -134,6 +142,65 @@ The settings palette opens automatically when the script runs. You can also reop
 | **Info panel** | Full stats: offset in px/%, direction, radii, quality rating |
 | **Brightness bar** | Horizontal bar — current brightness level with dim/OK/bright zones |
 | **Size bar** | Vertical bar — current donut size with small/ideal/large zones |
+
+### Display Zoom and Overlay Size
+
+The overlay is drawn into the frame in **image pixel** coordinates, so
+SharpCap's display zoom magnifies it along with the image: at 200% zoom the
+labels are drawn twice as large on screen as at 100%.
+
+With **Scale Overlay to Zoom** enabled (the default), all screen furniture —
+text, info panel, bottom bar, brightness and size bars, correction arrows and
+center crosshairs — is divided by the current zoom factor, so it stays the
+same on-screen size at any zoom. Circle geometry is never scaled: those must
+stay locked to the image pixels.
+
+The zoom factor is read from `SharpCap.ZoomPercent` automatically (a few
+older property names are probed as fallbacks). Check what it found with
+`zoom()` in the console:
+
+```
+zoom()
+```
+
+#### The legibility floor
+
+Exact compensation can't continue indefinitely. The overlay is rasterized at
+**image** resolution, so at 400% zoom holding a constant on-screen size means
+drawing the text at ~2pt and letting SharpCap magnify the result — constant in
+size, but mush.
+
+**Min Font Size (zoom)** stops the shrinking once the info panel font reaches
+it. Below that zoom level compensation is exact; above it, the overlay does
+grow on screen, but stays sharp. With the defaults (panel font 9, floor 6):
+
+| Display zoom | Overlay scale | Panel font drawn | On-screen size vs 100% |
+|---|---|---|---|
+| 100% | 1.00 | 9pt | same |
+| 150% | 0.67 | 6pt | same (floor just reached) |
+| 200% | 0.67 | 6pt | 1.3× |
+| 400% | 0.67 | 6pt | 2.7× |
+
+Useful range is **5–8**. Lower keeps size constant further up the zoom range at
+the cost of sharpness; 0 disables the floor entirely (text hits 3pt at 400%+).
+
+Note that a floor of 10 would disable compensation altogether — the default
+fonts are 8–10pt, so the floor would bind at 100% zoom and nothing would ever
+shrink. If you want bigger text overall, raise the font sizes rather than the
+floor; the floor scales with them (it is applied relative to the panel font).
+
+**Manual Zoom overrides auto-detection** — leave it at 0 unless auto-detection
+fails, and run `set_zoom(0)` to go back to auto if you set it earlier.
+
+If `zoom()` reports "unknown", the overlay is **not** being scaled and still
+grows with the zoom. Fix it by hand — `set_zoom(2.0)` in the console, or **Manual
+Zoom** on the Colors tab (then Save) — and run `find_zoom()` if you want to
+report the property name so auto-detection can be extended.
+
+Once the zoom property is found it is read fresh on every frame, so changing
+the zoom in SharpCap updates the overlay immediately. Only a *failed* lookup
+backs off (retried every 300 frames) — press **Restart**, or run
+`rescan_zoom()`, to force an immediate re-scan.
 
 ### Quality Ratings
 
@@ -189,6 +256,25 @@ Offset percentage is relative to the outer circle radius.
 - Click **Restart** in the settings palette, or type `restart()` in the console.
 - Re-running the script also works — it automatically cleans up the previous instance.
 
+### Overlay text is too big at high zoom
+
+Enable **Scale Overlay to Zoom** on the Display tab. If it's already on, run
+`zoom()` — if the detected zoom is "unknown", set **Manual Zoom** on the
+Colors tab to your display zoom (2.0 = 200%).
+
+### Overlay text is too small or blurry when zoomed in
+
+You're below the legibility floor — raise **Min Font Size (zoom)** on the
+Colors tab (try 7 or 8). `zoom()` reports whether the floor is currently
+active. See "The legibility floor" above for the trade-off.
+
+### Settings palette is tiny on a 4K monitor
+
+The palette sizes itself from the monitor DPI. If Windows display scaling is
+set to 100% on a high-resolution screen there's no DPI signal to use, so set
+**Palette Scale** on the Colors tab (1.5 or 2.0), press **Save**, and re-run
+the script.
+
 ### Overlay is slow or laggy
 
 - Set a smaller ROI in SharpCap to reduce the area analyzed.
@@ -212,6 +298,10 @@ Type these in the SharpCap scripting console:
 | `restart()` | Full detection restart (same as Restart button) |
 | `reset_tracking()` | Clear tracking and re-detect the donut |
 | `debug()` | Full diagnostic dump |
+| `zoom()` | Show the detected display zoom and current overlay scale |
+| `set_zoom(2.0)` | Set the display zoom by hand (0 = back to auto-detect) |
+| `find_zoom()` | Search the SharpCap API for the zoom property (diagnostic) |
+| `rescan_zoom()` | Re-scan for the zoom property now (also done by Restart) |
 | `debug_on()` / `debug_off()` | Toggle per-frame debug logging |
 | `stop()` | Fully stop the overlay |
 | `save_config()` / `load_config()` | Manually save or reload settings |
